@@ -1,0 +1,28 @@
+# Repo-wide tool configuration. Individual tools declare their own runtime
+# dependencies via PEP 723 inline metadata; this file is for dev tooling only.
+[project]
+name = "legiontools7a"
+version = "0.0.0"
+description = "Tools for the Lenovo Legion 7a (AMD Strix Halo) on Fedora"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.16"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PTH", "RUF", "S"]
+ignore = [
+  "S603", # subprocess without shell=True is the safe form; we call system tools a lot
+  "S607", # partial executable paths (e.g. "lspci") are expected
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"] # assert is fine in tests
+
+[tool.pytest.ini_options]
+testpaths = ["tools"]
+addopts = "--import-mode=importlib"

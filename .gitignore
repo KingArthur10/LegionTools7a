@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code: personal/local settings and memory are not shared
+.claude/settings.local.json
+CLAUDE.local.md
