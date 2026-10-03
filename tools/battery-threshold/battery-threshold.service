@@ -1,0 +1,22 @@
+[Unit]
+Description=Hold the battery at a custom charge limit (80-100%%)
+Documentation=https://github.com/KingArthur10/LegionTools7a/tree/main/tools/battery-threshold
+After=upower.service
+
+[Service]
+Type=simple
+Environment=TARGET=85
+EnvironmentFile=-/etc/default/battery-threshold
+ExecStart=/usr/bin/python3 /usr/local/bin/battery-threshold hold --target ${TARGET}
+Restart=on-failure
+RestartSec=30
+
+# Hardening: only needs to write to /sys/class/power_supply
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+
+[Install]
+WantedBy=multi-user.target
