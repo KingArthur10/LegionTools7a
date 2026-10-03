@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make lint)",
+      "Bash(make test)",
+      "Bash(make format)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv run ruff:*)",
+      "Bash(uvx ruff:*)",
+      "Bash(uvx pre-commit run:*)",
+      "Bash(shellcheck:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(lscpu:*)",
+      "Bash(lspci:*)",
+      "Bash(lsusb:*)",
+      "Bash(sensors:*)",
+      "Bash(uname:*)",
+      "Bash(powerprofilesctl get:*)",
+      "Bash(powerprofilesctl list:*)",
+      "Bash(rocm-smi:*)",
+      "Bash(amd-smi list:*)",
+      "Bash(amd-smi static:*)",
+      "Bash(amd-smi metric:*)"
+    ],
+    "deny": [
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push origin main:*)",
+      "Bash(rm -rf /:*)",
+      "Bash(sudo rm:*)",
+      "Bash(dd:*)",
+      "Bash(mkfs:*)",
+      "Bash(setenforce:*)",
+      "Bash(grubby:*)",
+      "Bash(fwupdmgr update:*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)",
+      "Bash(git push:*)",
+      "Bash(dnf install:*)",
+      "Bash(dnf remove:*)",
+      "Bash(systemctl:*)",
+      "Bash(powerprofilesctl set:*)",
+      "Bash(tee /sys/:*)",
+      "Bash(modprobe:*)"
+    ]
+  }
+}
