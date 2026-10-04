@@ -6,7 +6,7 @@ Tools I've made to help do things on my Lenovo Legion 7a (AMD Ryzen AI Max "Stri
 
 | Tool | Description |
 | ---- | ----------- |
-| _none yet_ | |
+| [face-unlock](tools/face-unlock/) | Windows Hello-style face unlock (Howdy + IR camera) for sudo, lock screen and polkit |
 
 Each tool lives in `tools/<name>/` with its own README.
 
