@@ -1,0 +1,8 @@
+# tier	role	repo	file	bytes	sha256
+1	primary	unsloth/Qwen-AgentWorld-35B-A3B-GGUF	Qwen-AgentWorld-35B-A3B-UD-Q5_K_M.gguf	26456194304	448973fd60e8121d23485cad33feb0fa866559c915d113dbb3115c3fd6d0089a
+1	primary	unsloth/Qwen3.6-35B-A3B-MTP-GGUF	Qwen3.6-35B-A3B-UD-Q4_K_M.gguf	22663387424	0b21525e972670ed59e1812e170b27c26355381f0656ecc4e25617ece7dac58b
+1	primary	unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf	18556689568	fadc3e5f8d42bf7e894a785b05082e47daee4df26680389817e2093056f088ad
+1	primary	unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF	Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf	14334446752	d14ba9edee1bb4c4996a726deb81e49ae81800a3216f0774634238c380aee496
+1	helper	ggml-org/gpt-oss-20b-GGUF	gpt-oss-20b-MXFP4.gguf	12109566624	27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901
+1	embed	Qwen/Qwen3-Embedding-0.6B-GGUF	Qwen3-Embedding-0.6B-Q8_0.gguf	639150592	06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439
+1	embed	Qwen/Qwen3-Embedding-4B-GGUF	Qwen3-Embedding-4B-Q4_K_M.gguf	2496703776	2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b
