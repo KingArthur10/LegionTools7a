@@ -540,6 +540,14 @@ def run_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def task_list(value: str) -> list[str]:
+    names = [n.strip() for n in value.split(",") if n.strip()]
+    unknown = sorted(set(names) - {t.name for t in TASKS})
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown task(s): {', '.join(unknown)}")
+    return names
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="llm-eval", description=__doc__.splitlines()[0])
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -547,7 +555,11 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="serve each model and run the tasks")
     r.add_argument("models", nargs="+", help="GGUF paths (absolute or relative to models dir)")
     r.add_argument("--backend", choices=BACKEND_ENV, default="vulkan")
-    r.add_argument("--tasks", nargs="+", choices=[t.name for t in TASKS])
+    r.add_argument(
+        "--tasks",
+        type=task_list,
+        help=f"comma-separated subset of: {','.join(t.name for t in TASKS)}",
+    )
     r.add_argument("--repeats", type=int, default=3, help="attempts per task (default: 3)")
     r.add_argument("--ctx", type=int, default=32768, help="server context (default: 32768)")
     r.add_argument("--port", type=int, default=8091)

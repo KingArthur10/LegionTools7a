@@ -36,3 +36,42 @@ ROCm runs use `ROCBLAS_USE_HIPBLASLT=1`. Values in tokens/second.
   16K context; full-attention Qwen3-Coder drops to ~40%.
 - Dense models are bandwidth-bound at 12–15 tok/s generation, as predicted
   (~256 GB/s ÷ ~16 GB of weights). MoE models with ~3B active run 4–6× faster.
+
+## Quality (2026-10-04)
+
+`llm_eval.py`, Vulkan, temperature 0.2, `max_tokens` 8192, 3 attempts per task.
+`log_root_cause` was re-run at 64K context (the first run overflowed 32K, a harness
+bug); `write_tests` ran in both passes (6 attempts). All five models loaded and ran
+at 64K context with a q8_0 KV cache within the 52 GiB budget.
+
+| Model | log_root_cause | diff_bug | write_tests | implement | json_extract | agentic_fix | Score | Wall time* |
+| ----- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | --: |
+| **Qwen3-Coder 30B-A3B** | 3/3 | 3/3 | 6/6 | 3/3 | 3/3 | 3/3 | **21/21** | **~1 min** |
+| Devstral Small 2 24B | 3/3 | 3/3 | 5/6 | 3/3 | 3/3 | 3/3 | 20/21 | ~4 min |
+| Qwen-AgentWorld 35B-A3B | 3/3 | 3/3 | 3/6 | 3/3 | 3/3 | 3/3 | 18/21 | ~10 min |
+| Qwen3.6 35B-A3B | 3/3 | 3/3 | 2/6 | 3/3 | 3/3 | 3/3 | 17/21 | ~9 min |
+| gpt-oss-20b | 2/3† | 3/3 | 4/6 | 0/3‡ | 3/3 | 3/3 | 15/21 | ~10 min |
+
+\* First pass, all six tasks × 3 attempts. † 32K run; 64K re-run 2/3.
+‡ HTTP 500: gpt-oss emitted `<|channel|>final code<|message|>`, which llama.cpp
+v0.5.0's Harmony parser rejects. That would fail in real use too.
+
+### Why models failed
+
+- **Thinking budget exhausted** (Qwen3.6 ×2, gpt-oss ×2, "no tests ran" / empty
+  answer): these models reason before answering and hit the 8,192-token limit with
+  no final output after ~140 s. For tool-style delegation they need thinking
+  disabled or a much larger budget.
+- **Arguable spec gap** (AgentWorld ×1): tests expected `ValueError` for `None`;
+  the reference raises `TypeError`. The docstring only says "invalid" text.
+- **Wrong assumption** (Devstral ×1): expected `ValueError` for an input the
+  reference accepts.
+
+### Caveats
+
+- **Ceiling effect.** These tasks are small; every model passed `diff_bug`,
+  `json_extract` and the agentic fix 3/3. The eval shows reliability on
+  delegation-sized work, not capability on hard multi-step problems, where the
+  reference Strix Halo benchmark ranked AgentWorld (8/10) well above Qwen3-Coder
+  (5/10).
+- 3 attempts per task is a small sample; treat one-attempt differences as noise.
