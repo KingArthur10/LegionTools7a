@@ -7,7 +7,7 @@ description = "Tools for the Lenovo Legion 7a (AMD Strix Halo) on Fedora"
 requires-python = ">=3.12"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.16"]
+dev = ["pre-commit>=4", "pytest>=8", "ruff>=0.16"]
 
 [tool.ruff]
 line-length = 100

@@ -2,10 +2,10 @@
 
 setup: ## Install dev deps and git hooks
 	uv sync
-	uv run --with pre-commit pre-commit install
+	uv run pre-commit install
 
 lint: ## Run all linters (same as CI)
-	SKIP=no-commit-to-branch uvx pre-commit run --all-files
+	SKIP=no-commit-to-branch uv run pre-commit run --all-files
 
 format: ## Auto-format Python
 	uv run ruff check --fix .

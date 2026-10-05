@@ -6,7 +6,7 @@ Tools I've made to help do things on my Lenovo Legion 7a (AMD Ryzen AI Max "Stri
 
 | Tool | Description |
 | ---- | ----------- |
-| _none yet_ | |
+| [battery-threshold](tools/battery-threshold/) | Show/set battery charge mode and hold a custom 80–100% charge limit |
 
 Each tool lives in `tools/<name>/` with its own README.
 
