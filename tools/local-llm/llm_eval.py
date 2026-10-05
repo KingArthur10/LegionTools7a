@@ -97,18 +97,31 @@ def extract_json(text: str) -> dict | None:
         return None
 
 
-def run_pytest(workdir: Path) -> bool:
+def run_pytest_output(workdir: Path) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(workdir)],
             cwd=workdir,
             capture_output=True,
+            text=True,
             timeout=PYTEST_TIMEOUT,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return False
-    return proc.returncode == 0
+        return False, "pytest timed out"
+    return proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def run_pytest(workdir: Path) -> bool:
+    return run_pytest_output(workdir)[0]
+
+
+def first_failure(output: str) -> str:
+    """The first assertion/error line from pytest output, for result details."""
+    for line in output.splitlines():
+        if line.startswith(("E ", "FAILED", "ERROR")):
+            return line.strip()[:160]
+    return output.strip().splitlines()[-1][:160] if output.strip() else ""
 
 
 @dataclass
@@ -129,14 +142,14 @@ class Task:
 
 def task_log_root_cause(client: Client) -> Outcome:
     lines = []
-    for i in range(3000):
+    for i in range(1200):  # ~20K tokens: fits the 32K eval context
         lines.append(f"2026-10-04T10:{i // 60 % 60:02d}:{i % 60:02d} INFO api request ok id={i}")
-        if i == 1712:
+        if i == 712:
             lines.append(
                 "2026-10-04T10:28:32 WARN db pool: all 20 connections in use "
                 "(max_connections=20), waiting"
             )
-        if 1713 <= i <= 1760:
+        if 713 <= i <= 760:
             lines.append(f"2026-10-04T10:28:{i % 60:02d} ERROR request id={i} timed out after 30s")
     answer = client.chat(
         "Here is a service log. In one sentence, what is the root cause of the errors?\n\n"
@@ -188,14 +201,18 @@ def task_write_tests(client: Client) -> Outcome:
         "invalid input. Reply with only the Python code.\n\n" + DURATION_IMPL
     )
     tests = extract_code(answer)
-    results = []
+    results, why = [], ""
     for impl in [DURATION_IMPL, *DURATION_MUTANTS]:
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "duration.py").write_text(impl)
             (Path(d) / "test_duration.py").write_text(tests)
-            results.append(run_pytest(Path(d)))
+            passed, output = run_pytest_output(Path(d))
+            if impl is DURATION_IMPL and not passed:
+                why = " | " + first_failure(output)
+            results.append(passed)
     ok = results[0] and not any(results[1:])
-    return Outcome(ok, f"correct={results[0]} mutants_caught={[not r for r in results[1:]]}")
+    caught = [not r for r in results[1:]]
+    return Outcome(ok, f"correct={results[0]} mutants_caught={caught}{why}")
 
 
 IMPLEMENT_SPEC = """Implement these two functions in one Python module. Reply with only the code.

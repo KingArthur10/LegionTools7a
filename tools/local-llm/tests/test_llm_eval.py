@@ -166,3 +166,18 @@ def test_summarize():
     table = le.summarize(rows)
     assert "| A | 1/2 | 1/2 | 3 |" in table
     assert "| B | 1/1 | 1/1 | 3 |" in table
+
+
+def test_first_failure_picks_assertion_line():
+    out = "..F\n    def test_x():\nE   assert 3 == 4\nFAILED test_a.py::test_x\n"
+    assert le.first_failure(out) == "E   assert 3 == 4"
+
+
+def test_write_tests_reports_why_correct_impl_failed():
+    wrong = (
+        "```python\nfrom duration import parse_duration\n\n"
+        "def test_x():\n    assert parse_duration('1m') == 61\n```"
+    )
+    outcome = le.task_write_tests(FakeClient(wrong))
+    assert not outcome.passed
+    assert "60 == 61" in outcome.detail
