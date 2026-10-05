@@ -181,3 +181,16 @@ def test_write_tests_reports_why_correct_impl_failed():
     outcome = le.task_write_tests(FakeClient(wrong))
     assert not outcome.passed
     assert "60 == 61" in outcome.detail
+
+
+def test_tasks_option_does_not_swallow_models():
+    args = le.build_parser().parse_args(
+        ["run", "--tasks", "diff_bug,implement", "a.gguf", "b.gguf"]
+    )
+    assert args.tasks == ["diff_bug", "implement"]
+    assert args.models == ["a.gguf", "b.gguf"]
+
+
+def test_tasks_option_rejects_unknown():
+    with pytest.raises(SystemExit):
+        le.build_parser().parse_args(["run", "--tasks", "nope", "a.gguf"])
