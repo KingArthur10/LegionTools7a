@@ -54,10 +54,17 @@ nothing here is a final choice. Sizes are GGUF file sizes from Hugging Face.
 
 ### Already downloaded (Ollama, `/var/lib/ollama`)
 
-Reused as-is (Ollama blobs are plain GGUF) and compared against their official builds:
-`qwen3-coder-next-abliterated:q4_K` (51.7 GB; offload test only),
-`gemma-4-abliterated:31b` (19.9 GB), `Qwen3.8-27B-Uncensored` (17.7 GB),
-`gemma-4-abliterated:e4b` (9.6 GB).
+Tested with llama.cpp v0.5.0 (2026-10-04). Ollama's newer engine stores some models
+in its own tensor layout, so only one blob is reusable:
+
+| Ollama model | Loads in llama.cpp? |
+| ------------ | ------------------- |
+| `orcarouter/Qwen3.8-27B-Uncensored` (17.7 GB) | Yes. Dense: ~260 tok/s prompt, ~12 tok/s generation on both backends |
+| `huihui_ai/qwen3-coder-next-abliterated:q4_K` (51.7 GB) | No: `tensor 'blk.0.ssm_dt.bias' not found` |
+| `huihui_ai/gemma-4-abliterated:31b` (19.9 GB) | No: wrong number of tensors (1189 vs 833) |
+| `huihui_ai/gemma-4-abliterated:e4b` (9.6 GB) | No: wrong number of tensors (2131 vs 720) |
+
+Unrestricted variants for llama.cpp must come from standard GGUF repos on Hugging Face.
 
 ## Excluded
 
