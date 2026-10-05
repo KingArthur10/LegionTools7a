@@ -59,3 +59,5 @@ ROCBLAS_USE_HIPBLASLT=1 $B/build-rocm/bin/llama-bench \
 - llama.cpp v0.5.0 removed rocWMMA flash attention (`GGML_HIP_ROCWMMA_FATTN`,
   PR #26046); older Strix Halo guides that recommend it are out of date.
 - Ollama (`/usr/local/bin/ollama`) is untouched for now; it's retired in phase 4.
+  Most of its downloaded models use Ollama-specific tensor layouts that llama.cpp
+  can't load (see docs/local-llm-models.md), so don't assume blobs are reusable.
