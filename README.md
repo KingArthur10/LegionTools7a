@@ -7,6 +7,7 @@ Tools I've made to help do things on my Lenovo Legion 7a (AMD Ryzen AI Max "Stri
 | Tool | Description |
 | ---- | ----------- |
 | [battery-threshold](tools/battery-threshold/) | Show/set battery charge mode and hold a custom 80–100% charge limit |
+| [face-unlock](tools/face-unlock/) | Windows Hello-style face unlock (Howdy + IR camera) for sudo, lock screen and polkit |
 
 Each tool lives in `tools/<name>/` with its own README.
 
