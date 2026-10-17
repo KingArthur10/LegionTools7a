@@ -57,7 +57,7 @@ cmd_install() {
     [[ -d /srv/llm/models ]] || die "/srv/llm/models missing"
 
     log "Creating system user 'llm'"
-    install -m 644 /dev/stdin /etc/sysusers.d/llm.conf <<'EOF'
+    install -D -m 644 /dev/stdin /etc/sysusers.d/llm.conf <<'EOF'
 u llm - "Local LLM server" /var/lib/llm
 m llm render
 m llm video
