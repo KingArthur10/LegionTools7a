@@ -44,11 +44,15 @@ fetch_source() {
 }
 
 # Options shared by both builds. GGML_NATIVE tunes CPU code for this Zen 5 host.
+# shellcheck disable=SC2016 # $ORIGIN is for the dynamic linker, not the shell
 cmake_common=(
     -DCMAKE_BUILD_TYPE=Release
     -DGGML_NATIVE=ON
     -DLLAMA_CURL=ON
     -DLLAMA_BUILD_TESTS=OFF
+    # Relocatable install: binaries find their libraries relative to themselves,
+    # so `cmake --install --prefix /opt/llama.cpp` works without the build tree.
+    '-DCMAKE_INSTALL_RPATH=$ORIGIN/../lib64:$ORIGIN/../lib'
 )
 
 build_rocm() {
