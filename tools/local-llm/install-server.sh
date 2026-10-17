@@ -76,6 +76,7 @@ EOF
         log "Backed up existing /etc/llama-swap/config.yaml"
     fi
     install -D -m 644 "$HERE/llama-swap.yaml" /etc/llama-swap/config.yaml
+    install -D -m 644 -t /etc/llama-swap/templates "$HERE"/templates/*.jinja
     install -m 644 "$HERE/llama-swap.service" "$UNIT"
     restorecon -RF /opt/llama.cpp /opt/llama-swap /etc/llama-swap "$UNIT"
 

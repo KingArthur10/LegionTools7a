@@ -36,6 +36,7 @@ models:
       ${server}
       -m ${models}/unsloth/Qwen-AgentWorld-35B-A3B-GGUF/Qwen-AgentWorld-35B-A3B-UD-Q5_K_M.gguf
       -c 65536
+      --chat-template-file /etc/llama-swap/templates/agentworld.jinja
     ttl: 1800
 
   "embed":

@@ -64,6 +64,7 @@ What `install` changes:
 | `/opt/llama.cpp/` | llama.cpp Vulkan install (replaced on every install) |
 | `/opt/llama-swap/llama-swap` | llama-swap binary (pinned version + checksum) |
 | `/etc/llama-swap/config.yaml` | copy of `llama-swap.yaml`; a differing old one is backed up as `config.yaml.bak.<epoch>` |
+| `/etc/llama-swap/templates/` | patched chat templates from `templates/` |
 | `/etc/systemd/system/llama-swap.service` | hardened unit, loopback only |
 
 Models in `llama-swap.yaml` (numbers from docs/local-llm-benchmarks.md):
@@ -104,6 +105,12 @@ The first request to a model waits for it to load (up to `healthCheckTimeout`).
 
 ## Notes
 
+- **`templates/agentworld.jinja`**: Claude Code sends a `system` message in the
+  middle of the conversation (environment info after the first user turn).
+  Qwen-AgentWorld's embedded template rejects that with HTTP 500 ("System message
+  must be at the beginning"), and `CLAUDE_CODE_FORCE_MID_CONVERSATION_SYSTEM=0`
+  doesn't stop it. The patched copy renders such messages in place. Qwen3-Coder's
+  template already accepts them.
 - llama.cpp and every model file are **pinned** (commit; size + SHA-256 in
   `models.tsv`). Bump them deliberately and re-run the benchmarks.
 - `ROCBLAS_USE_HIPBLASLT=1` routes rocBLAS matmuls through hipBLASLt's tuned
