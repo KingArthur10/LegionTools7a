@@ -5,7 +5,8 @@
 Run local LLMs on the Radeon 8060S (Strix Halo, `gfx1151`) with **llama.cpp**, for
 use as a local tool from Claude Code (MCP) and as an offline Claude Code backend.
 This directory covers the engine, the model files, benchmarking and a local
-endpoint (llama-swap as a system service); the MCP tool is a later phase.
+endpoint (llama-swap as a system service) plus `claude-local`, which runs Claude
+Code entirely on a local model; the MCP tool is a later phase.
 
 Why llama.cpp rather than Ollama: both of our workloads are dominated by long
 prompts (Claude Code's system prompt + tool schemas, or large files/logs for the
@@ -102,6 +103,40 @@ journalctl -u llama-swap -f          # load/unload and server logs
 ```
 
 The first request to a model waits for it to load (up to `healthCheckTimeout`).
+
+### Claude Code on a local model
+
+`claude-local.sh` starts Claude Code with every request going to llama-swap
+instead of Anthropic. Your normal `claude` setup and login are untouched, so
+switching back is just running `claude`.
+
+```bash
+ln -s "$PWD/claude-local.sh" ~/.local/bin/claude-local   # once
+
+claude-local                         # qwen3-coder (default)
+claude-local --model agentworld      # thinking model, better at long sessions
+claude-local -p "explain main.py"    # any other claude arguments pass through
+claude-local --list                  # models on the endpoint
+eval "$(claude-local --env)"         # export the settings into this shell instead
+```
+
+It checks the endpoint is up, loads the model, and sets:
+
+| Setting | Why |
+| ------- | --- |
+| `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` | point at llama-swap (the token is a placeholder); `ANTHROPIC_API_KEY` is unset |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_{HAIKU,SONNET,OPUS}_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL` | all the same model: llama-swap keeps one chat model loaded, so mixing would reload it on every subagent call |
+| `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the server's real context (read from `/upstream/<model>/props`); otherwise Claude Code assumes 200K and never compacts in time |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` | the default 32K output reservation is half of a 64K window |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_COST_WARNINGS` | no telemetry; the cost shown is meaningless for a local model |
+
+Expected noise: an `unrecognized_model` line and a note that claude.ai connectors
+are disabled (they need your claude.ai login, which isn't used here). `/model`
+works, but switching to the other chat model reloads it (~10 s).
+
+Tested on Claude Code 2.1.292: both models complete an edit → run tests → fix loop
+(10/10 tests). Claude Code's own system prompt and tools take ~10K tokens of the
+64K context. Prompt caching works: llama-server reuses the shared prefix.
 
 ## Notes
 
