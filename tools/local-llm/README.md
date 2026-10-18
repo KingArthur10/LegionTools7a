@@ -127,10 +127,9 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
   `--root`) and the temp directory (`--allow DIR` adds more). Directories follow
   `.gitignore`. Secret-looking names (`.env*`, keys, `*credentials*`, `*secret*`,
   `~/.ssh`) and binaries are skipped, and the answer lists what was skipped.
-- **Limits:** 100K tokens per call (counted with the model's tokenizer; reading runs at
-  ~370 tokens/s, so that is 4-5 minutes); narrow
-  the paths beyond that. llama-swap serves one request at a time, so parallel
-  calls queue. After 30 minutes idle, the first call waits ~10 s for the model
+- **Limits:** 100K tokens per call, counted with the model's tokenizer. Reading
+  runs at ~370 tokens/s, so that is 4-5 minutes; narrow the paths beyond that.
+  llama-swap serves one request at a time, so parallel calls queue. After 30 minutes idle, the first call waits ~10 s for the model
   to load.
 - **Trust:** answers come from a 30B model. The server's instructions tell Claude
   to treat them as leads and to read cited lines itself before editing.
