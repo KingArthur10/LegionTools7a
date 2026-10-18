@@ -138,8 +138,11 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
 - **`local_task` workflow:** Claude writes the spec and the tests, the worker
   implements, and Claude reviews `git diff`. Rules the server enforces:
   - git repositories only (with a commit), so changes can be reviewed and undone;
-  - the worker may edit files and run only `test_command`; it gets no MCP
-    servers (no recursion) and runs in `acceptEdits` mode, so edits need no approval;
+  - the worker may edit files **inside the project only** and run only
+    `test_command`; it gets no MCP servers (no recursion). It runs in
+    `acceptEdits` mode with no unscoped `Edit`/`Write` allow rules: a rule without a
+    path allows writing anywhere, and an early worker did write a copy of its
+    output into another repo. Refused actions are listed in the report;
   - existing test files (`test_*`, `*_test.*`, `*.spec.*`, `tests/`) and any
     `protect` paths are denied to the worker, and if one changes anyway the server
     restores it and puts a warning at the top of the report;

@@ -96,7 +96,9 @@ TASK_MAX_TIMEOUT = 28 * 60  # Claude Code drops a silent stdio tool call after 3
 TEST_TIMEOUT = 5 * 60
 TASK_SUMMARY_CHARS = 1500
 TEST_OUTPUT_LINES = 30
-WORKER_TOOLS = ("Read", "Grep", "Glob", "Edit", "Write")
+# No bare Edit/Write: a rule without a path allows writing anywhere. acceptEdits mode
+# already approves edits inside the project, and -p mode refuses everything else.
+WORKER_TOOLS = ("Read", "Grep", "Glob")
 # Existing files matching these are protected unless listed as targets: a worker that
 # can't make tests pass tends to rewrite them.
 TEST_FILE_PATTERNS = ("test_*", "*_test.*", "*.test.*", "*.spec.*", "conftest.py")
@@ -941,8 +943,17 @@ def task(
         result = json.loads(out)
         summary = str(result.get("result") or "").strip()
         turns = result.get("num_turns", "?")
+        denials = sorted(
+            {
+                f"{d.get('tool_name')}: "
+                + str((d.get("tool_input") or {}).get("file_path")
+                      or (d.get("tool_input") or {}).get("command") or "?")[:120]
+                for d in result.get("permission_denials") or []
+            }
+        )  # fmt: skip
         status = "error" if result.get("is_error") else "finished"
     except ValueError:
+        denials = []
         # Not JSON: crashed or killed. Show stderr minus claude-local's start-up lines.
         noise = ("claude-local:", "⚠", "[claude-code:")
         lines = [ln for ln in (err or out).splitlines() if not ln.startswith(noise)]
@@ -965,6 +976,11 @@ def task(
     else:
         parts.append("Tests: none given, so nothing was verified.")
     parts.append("Changed files:\n" + ("\n".join(changes) if changes else "  (none)"))
+    if denials:
+        parts.append(
+            "Refused actions (outside the project, protected or not allowed):\n"
+            + "\n".join(f"  {d}" for d in denials)
+        )
     if len(summary) > TASK_SUMMARY_CHARS:
         summary = summary[:TASK_SUMMARY_CHARS] + " [...]"
     parts.append("Worker summary:\n" + (summary or "(none)"))
