@@ -129,6 +129,10 @@ It checks the endpoint is up, loads the model, and sets:
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the server's real context (read from `/upstream/<model>/props`); otherwise Claude Code assumes 200K and never compacts in time |
 | `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` | the default 32K output reservation is half of a 64K window |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_COST_WARNINGS` | no telemetry; the cost shown is meaningless for a local model |
+| `--permission-mode default` (unless you pass your own) | auto mode's safety classifier would run on the local model: each check took over Claude Code's 60 s limit and was denied, and a small local model shouldn't be trusted to judge risk anyway |
+
+`--env` prints only the environment variables, so a `claude` started that way
+keeps your configured permission mode. Add `--permission-mode default` yourself.
 
 Expected noise: an `unrecognized_model` line and a note that claude.ai connectors
 are disabled (they need your claude.ai login, which isn't used here). `/model`
