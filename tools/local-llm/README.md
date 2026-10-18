@@ -133,6 +133,10 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
   to load.
 - **Trust:** answers come from a 30B model. The server's instructions tell Claude
   to treat them as leads and to read cited lines itself before editing.
+- **Measured:** in A/B runs it saved Opus no tokens: Opus already greps and reads
+  only what it needs, and the local model was slower and missed a root cause in
+  a long log. It is installed as an optional tool, not recommended to Claude. See
+  [docs/local-llm-benchmarks.md](../../docs/local-llm-benchmarks.md#hybrid-reading-via-mcp-2026-10-18).
 - **Skip it under `claude-local`:** there the "local tool" is the same model
   Claude Code already runs on.
 
