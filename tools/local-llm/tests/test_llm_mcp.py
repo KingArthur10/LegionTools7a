@@ -30,6 +30,11 @@ class FakeClient:
     def context_size(self) -> int:
         return self.ctx
 
+    def count_tokens(self, text):
+        # Digits cost a token each (like Qwen's tokenizer); other text ~4 chars/token.
+        digits = sum(c.isdigit() for c in text)
+        return digits + (len(text) - digits) // 4
+
     def chat(self, system, prompt, max_tokens):
         self.prompts.append((system, prompt))
         return self.answers.pop(0) if self.answers else "answer"
@@ -128,9 +133,20 @@ def test_segments_empty_file():
     assert list(mcp.segments("e.txt", [], 400)) == ["=== e.txt (empty file) ==="]
 
 
-def test_pack_respects_budget():
-    chunks = mcp.pack(["a" * 40, "b" * 40, "c" * 40], budget=90)
-    assert chunks == ["a" * 40 + "\n\n" + "b" * 40, "c" * 40]
+def test_pack_respects_token_budget():
+    blocks = [mcp.Block("a", 40), mcp.Block("b", 40), mcp.Block("c", 40)]
+    assert mcp.pack(blocks, budget=90) == ["a\n\nb", "c"]
+
+
+def test_file_blocks_follow_token_density():
+    client = FakeClient()
+    prose = [f"word {'x' * 70}" for _ in range(200)]
+    digits = ["2026101208000" + "1234567890" * 6 for _ in range(200)]
+    prose_blocks = mcp.file_blocks(client, "p.txt", prose, budget=1000)
+    digit_blocks = mcp.file_blocks(client, "d.log", digits, budget=1000)
+    assert len(digit_blocks) > 2 * len(prose_blocks)
+    for b in prose_blocks + digit_blocks:
+        assert client.count_tokens(b.text) <= 1000
 
 
 # --------------------------------------------------------------------------- local_ask
@@ -225,6 +241,30 @@ def test_search_reembeds_changed_and_drops_deleted(project, tmp_path):
     assert "b.py" not in out
     index = json.loads(next(cache.glob("index-*.json")).read_text())
     assert sorted(index["files"]) == ["src/a.py"]
+
+
+def test_search_caps_new_embeddings_and_resumes(project, tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp, "SEARCH_MAX_NEW_CHUNKS", 2)
+    for i in range(5):
+        (project / "src" / f"m{i}.py").write_text(f"def f{i}():\n    pass\n")
+    cache = tmp_path / "cache"
+    ws = mcp.Workspace(project)
+    out = mcp.search(FakeClient(), ws, "x", cache_dir=cache)
+    assert "2 re-embedded" in out
+    assert "Index incomplete: 5 files" in out
+    out = mcp.search(FakeClient(), ws, "x", cache_dir=cache)
+    assert "Index incomplete: 3 files" in out
+    for _ in range(2):
+        out = mcp.search(FakeClient(), ws, "x", cache_dir=cache)
+    assert "Index incomplete" not in out
+
+
+def test_search_skips_large_files(project, tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp, "SEARCH_MAX_FILE_BYTES", 100)
+    (project / "src" / "vendor.h").write_text("alpha\n" * 50)
+    out = mcp.search(FakeClient(), mcp.Workspace(project), "alpha", cache_dir=tmp_path / "c")
+    assert "vendor.h" not in out
+    assert "2 files" in out
 
 
 def test_search_outside_project(project, tmp_path):

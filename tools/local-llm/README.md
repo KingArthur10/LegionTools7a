@@ -115,7 +115,7 @@ answer does.
 | Tool | Does |
 | ---- | ---- |
 | `local_ask(question, paths)` | Answers a question about files, directories or globs with `path:line` citations. Input larger than the 64K context is split; each part is read for notes and the notes are combined |
-| `local_search(query, path?)` | Semantic search with `embed`. Returns `path:start-end` ranges plus a one-line preview. The index is cached in `~/.cache/legiontools7a/llm-mcp/` and only changed files are re-embedded |
+| `local_search(query, path?)` | Semantic search with `embed`. Returns `path:start-end` ranges plus a one-line preview. The index is cached in `~/.cache/legiontools7a/llm-mcp/` and only changed files are re-embedded. One call embeds at most ~1,200 new chunks (~1 min); a bigger first index says it is incomplete and continues on the next call. Files over 300 KB are left out |
 
 ```bash
 claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in every project
@@ -127,7 +127,8 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
   `--root`) and the temp directory (`--allow DIR` adds more). Directories follow
   `.gitignore`. Secret-looking names (`.env*`, keys, `*credentials*`, `*secret*`,
   `~/.ssh`) and binaries are skipped, and the answer lists what was skipped.
-- **Limits:** about 250K tokens per call (roughly 4 minutes of reading); narrow
+- **Limits:** 100K tokens per call (counted with the model's tokenizer; reading runs at
+  ~370 tokens/s, so that is 4-5 minutes); narrow
   the paths beyond that. llama-swap serves one request at a time, so parallel
   calls queue. After 30 minutes idle, the first call waits ~10 s for the model
   to load.

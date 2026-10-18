@@ -49,12 +49,14 @@ CACHE_DIR = (
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_VERSION = "0.1.0"
 
-CHARS_PER_TOKEN = 3  # conservative for code; the real ratio is ~3.5-4
 MAX_FILE_BYTES = 2_000_000
-MAX_INPUT_TOKENS = 250_000  # ~4 min of prompt processing; beyond that, narrow the paths
+MAX_INPUT_TOKENS = 100_000  # ~4-5 min at the measured ~370 tokens/s; beyond that, narrow paths
 ANSWER_TOKENS = 1500
 NOTE_TOKENS = 1024
 PROMPT_OVERHEAD_TOKENS = 1024
+# Chunks are cut by characters using each file's measured characters per token
+# (code ~3.5, logs full of digits ~1.6); leave room for uneven spread within a file.
+TOKEN_SAFETY = 0.85
 NOTHING = "NOTHING RELEVANT"
 
 SKIP_DIRS = {
@@ -68,6 +70,8 @@ SECRET_NAMES = (
     "*credentials*", "*secret*",
 )  # fmt: skip
 
+SEARCH_MAX_FILE_BYTES = 300_000  # bigger files are usually vendored or generated
+SEARCH_MAX_NEW_CHUNKS = 1200  # per call: ~1 min at ~20 chunks/s; the rest on later calls
 SEARCH_WINDOW = 40  # lines per embedded chunk
 SEARCH_STEP = 30  # 10 lines of overlap
 SEARCH_CHUNK_CHARS = 4000
@@ -202,6 +206,12 @@ class Client:
             props = self._request(f"/upstream/{self.model}/props")
             self._ctx = int(props["default_generation_settings"]["n_ctx"])
         return self._ctx
+
+    def count_tokens(self, text: str) -> int:
+        """Exact token count from the chat model's tokenizer (fast; no generation)."""
+        if not text:
+            return 0
+        return len(self._request(f"/upstream/{self.model}/tokenize", {"content": text})["tokens"])
 
     def chat(self, system: str, prompt: str, max_tokens: int) -> str:
         payload = {
@@ -352,17 +362,32 @@ def segments(name: str, lines: list[str], budget: int) -> Iterator[str]:
         yield f"=== {name} (empty file) ==="
 
 
-def pack(blocks: list[str], budget: int) -> list[str]:
-    """Group blocks into chunks of at most `budget` characters."""
+@dataclass
+class Block:
+    text: str
+    tokens: int
+
+
+def file_blocks(client: Client, name: str, lines: list[str], budget: int) -> list[Block]:
+    """A file cut into blocks of at most `budget` tokens, using its measured token density."""
+    text = "\n".join(f"{n}: {line}" for n, line in enumerate(lines, 1))
+    tokens = client.count_tokens(text) or 1
+    chars_per_token = max(len(text), 1) / tokens
+    char_budget = int(budget * chars_per_token * TOKEN_SAFETY)
+    return [Block(b, int(len(b) / chars_per_token) + 1) for b in segments(name, lines, char_budget)]
+
+
+def pack(blocks: list[Block], budget: int) -> list[str]:
+    """Group blocks into chunks of at most `budget` tokens."""
     chunks: list[str] = []
     current: list[str] = []
     size = 0
     for block in blocks:
-        if current and size + len(block) + 2 > budget:
+        if current and size + block.tokens > budget:
             chunks.append("\n\n".join(current))
             current, size = [], 0
-        current.append(block)
-        size += len(block) + 2
+        current.append(block.text)
+        size += block.tokens
     if current:
         chunks.append("\n\n".join(current))
     return chunks
@@ -383,16 +408,14 @@ def ask(
     files, skipped = ws.expand(paths)
     if not files:
         raise ToolError("no readable files. " + "; ".join(skipped))
-    contents = [(ws.display(p), read_lines(p)) for p in files]
-    total_chars = sum(len(line) + 8 for _, lines in contents for line in lines)
-    if total_chars // CHARS_PER_TOKEN > MAX_INPUT_TOKENS:
+    budget = client.context_size() - ANSWER_TOKENS - PROMPT_OVERHEAD_TOKENS
+    blocks = [b for p in files for b in file_blocks(client, ws.display(p), read_lines(p), budget)]
+    total_tokens = sum(b.tokens for b in blocks)
+    if total_tokens > MAX_INPUT_TOKENS:
         raise ToolError(
-            f"{len(files)} files, about {total_chars // CHARS_PER_TOKEN // 1000}K tokens: "
-            f"over the {MAX_INPUT_TOKENS // 1000}K limit. Narrow the paths."
+            f"{len(files)} files, {total_tokens // 1000}K tokens: over the "
+            f"{MAX_INPUT_TOKENS // 1000}K limit (~4-5 min of reading). Narrow the paths."
         )
-
-    budget = (client.context_size() - ANSWER_TOKENS - PROMPT_OVERHEAD_TOKENS) * CHARS_PER_TOKEN
-    blocks = [b for name, lines in contents for b in segments(name, lines, budget)]
     chunks = pack(blocks, budget)
     calls = 0
 
@@ -414,7 +437,7 @@ def ask(
         else:
             # Notes are short, but merge in rounds if they still overflow the context.
             while True:
-                groups = pack(notes, budget)
+                groups = pack([Block(n, client.count_tokens(n)) for n in notes], budget)
                 merged = [
                     client.chat(SYSTEM_REDUCE, f"Notes:\n\n{g}\n\nQuestion: {question}",
                                 ANSWER_TOKENS)
@@ -427,9 +450,8 @@ def ask(
                 notes = merged
 
     seconds = time.monotonic() - start
-    ktokens = total_chars // CHARS_PER_TOKEN // 1000
     header = (
-        f"[local model {client.model} · {len(files)} files, ~{ktokens}K"
+        f"[local model {client.model} · {len(files)} files, {total_tokens / 1000:.0f}K"
         f" tokens, {calls} call{'s' if calls != 1 else ''} · {seconds:.0f} s"
         " · smaller model: verify cited lines before relying on them]"
     )
@@ -496,33 +518,49 @@ class Index:
         except (OSError, ValueError):
             pass
 
-    def update(self, files: list[Path], progress: Progress = no_progress) -> int:
-        """Re-embed new or changed files; returns how many files were embedded."""
+    def update(self, files: list[Path], progress: Progress = no_progress) -> tuple[int, list[Path]]:
+        """Embed new or changed files, at most SEARCH_MAX_NEW_CHUNKS chunks per call.
+
+        Returns how many files were embedded and the files still waiting. Progress is
+        saved after each file, so an interrupted or capped run is not lost.
+        """
         entries: dict[str, Any] = self.data["files"]
         gone = [name for name in entries if not (self.ws.root / name).is_file()]
         for name in gone:
             del entries[name]
-        stale: list[tuple[str, Path]] = []
+        stale: list[Path] = []
         for path in files:
+            stat = path.stat()
+            entry = entries.get(self.ws.display(path))
+            if not entry or entry["mtime_ns"] != stat.st_mtime_ns or entry["size"] != stat.st_size:
+                stale.append(path)
+        done = 0
+        embedded = 0
+        last_save = time.monotonic()
+        for i, path in enumerate(stale):
+            parts = list(windows(read_lines(path)))
+            if done and done + len(parts) > SEARCH_MAX_NEW_CHUNKS:
+                break
             name = self.ws.display(path)
             stat = path.stat()
-            entry = entries.get(name)
-            if not entry or entry["mtime_ns"] != stat.st_mtime_ns or entry["size"] != stat.st_size:
-                stale.append((name, path))
-        pending: list[tuple[str, int, int, str]] = []
-        for name, path in stale:
-            stat = path.stat()
-            entries[name] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "chunks": []}
-            pending += [(name, s, e, t) for s, e, t in windows(read_lines(path))]
-        for i in range(0, len(pending), EMBED_BATCH):
-            progress(i, len(pending), f"embedding {len(pending)} chunks")
-            batch = pending[i : i + EMBED_BATCH]
-            vectors = self.client.embed([f"{name}\n{text}" for name, _, _, text in batch])
-            for (name, start, end, _), vector in zip(batch, vectors, strict=True):
-                entries[name]["chunks"].append([start, end, pack_vector(vector)])
-        if stale or gone:
+            chunks: list[list[Any]] = []
+            for j in range(0, len(parts), EMBED_BATCH):
+                progress(done + j, done + len(parts), f"embedding {name}")
+                batch = parts[j : j + EMBED_BATCH]
+                vectors = self.client.embed([f"{name}\n{text}" for _, _, text in batch])
+                chunks += [
+                    [start, end, pack_vector(v)]
+                    for (start, end, _), v in zip(batch, vectors, strict=True)
+                ]
+            entries[name] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "chunks": chunks}
+            done += len(parts)
+            embedded = i + 1
+            if time.monotonic() - last_save > 10:
+                self.save()
+                last_save = time.monotonic()
+        if embedded or gone:
             self.save()
-        return len(stale)
+        return embedded, stale[embedded:]
 
     def save(self) -> None:
         self.file.parent.mkdir(parents=True, exist_ok=True)
@@ -568,16 +606,26 @@ def search(
     if not directory.is_relative_to(ws.root):
         raise ToolError(f"{path}: search covers the project only")
     files, _ = ws.expand([str(directory)])
-    files = [p for p in files if not any(fnmatch.fnmatch(p.name, g) for g in SEARCH_SKIP_NAMES)]
+    files = [
+        p
+        for p in files
+        if p.stat().st_size <= SEARCH_MAX_FILE_BYTES
+        and not any(fnmatch.fnmatch(p.name, g) for g in SEARCH_SKIP_NAMES)
+    ]
     if not files:
         raise ToolError(f"{path}: no text files to search")
     index = Index(ws, client, cache_dir)
-    embedded = index.update(files, progress)
+    embedded, waiting = index.update(files, progress)
     hits = index.search(query, files, max(1, min(limit, 50)))
     lines = [
         f"[local search · {len(files)} files · {embedded} re-embedded"
         f" · {time.monotonic() - start:.1f} s]"
     ]
+    if waiting:
+        lines.append(
+            f"Index incomplete: {len(waiting)} files not indexed yet, so results cover only "
+            "the indexed part. Call again to continue indexing, or pass a narrower path."
+        )
     for i, h in enumerate(hits, 1):
         lines.append(f"{i}. {h.path}:{h.start}-{h.end} ({h.score:.2f})  {h.preview}")
     return "\n".join(lines)
