@@ -75,3 +75,46 @@ v0.5.0's Harmony parser rejects. That would fail in real use too.
   reference Strix Halo benchmark ranked AgentWorld (8/10) well above Qwen3-Coder
   (5/10).
 - 3 attempts per task is a small sample; treat one-attempt differences as noise.
+
+## Hybrid reading via MCP (2026-10-18)
+
+Does handing reading to the local model (`llm_mcp.py`: `local_ask`, `local_search`)
+save Claude tokens? Claude Code 2.1.292, Opus 5.5, `claude -p --output-format json`,
+one run per cell. Conditions: **A** no MCP server; **B** server available plus a
+system-prompt note recommending it for bulk reading; **C** prompt requires reading
+through the local tools (Read allowed only to verify two line ranges).
+
+| Task | A | B | C |
+| ---- | :-: | :-: | :-: |
+| Root cause in a 6,000-line synthetic service log (387 KB) | $0.18, 15 s ✓ | $0.21, 21 s ✓, tools unused | $0.17, 26 s ✓ (local_ask failed†; answered from local_search) |
+| Summarize every tool in `tools/` | $0.20, 13 s ✓ | $0.18, 16 s ✓, tools unused | $0.16, 31 s ✓ |
+| How `battery-threshold` restores the previous limit | $0.14, 8 s ✓ | $0.13, 17 s ✓, tools unused | $0.15, 48 s ✓ |
+| llama.cpp: Anthropic → internal format mapping | $0.20, 14 s ✓ | – | not finished‡ |
+| llama.cpp: architecture of `tools/server` | $0.25, 28 s ✓ | – | not run‡ |
+
+† Overflowed the 64K context; fixed since (see the bug notes below).
+‡ First-time `local_search` over the whole llama.cpp tree had no cap and ran for
+~an hour. Indexing is capped per call now.
+
+The log question from the shell with the fixed `local_ask`, first 3,000 lines
+(~135K tokens): **6 min**, and the answer named the symptom (pool exhausted) but
+**missed the trigger** (`max_connections: 50 -> 5` on line 2406, which was in its
+input) and gave the wrong start time. Opus with grep got all three right in 15 s.
+
+### Findings
+
+- **No saving on reading.** Opus already reads little: it greps and reads the
+  matching ranges. Most of each run's cost is the fixed system prompt and tool
+  definitions (~20K tokens per turn, served from cache), which delegation can't
+  remove.
+- **Claude doesn't choose the tools.** Claude Code defers MCP tool definitions
+  behind ToolSearch, so in B they were never loaded. `"alwaysLoad": true` on the
+  server would change that, but given the results there's no reason to.
+- **The local model is a weak reader of noisy input.** ~370 tokens/s end to end
+  for map-reduce over a long log, and it missed an INFO-level cause.
+- **Token density varies 2×.** Code is ~3.5 characters per token; a log full of
+  timestamps is 1.65 (Qwen's tokenizer splits digits). `local_ask` measures each
+  file with `/tokenize` rather than assuming a ratio.
+- **Conclusion:** keep `local_ask` / `local_search` as optional tools (no
+  `CLAUDE.md` nudge, no `alwaysLoad`). The hybrid effort moves to output: having
+  the local model *write* well-specified code with tests, Opus reviewing.
