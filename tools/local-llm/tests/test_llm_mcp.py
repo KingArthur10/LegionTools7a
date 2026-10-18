@@ -368,7 +368,9 @@ FAKE_WORKER = textwrap.dedent("""
     Path("README.md").write_text("changed\\n")
     Path("scratch.py").write_text("print(1)\\n")
     print(json.dumps({"result": "Added add() in calc.py. PROMPT=" + prompt[:40],
-                      "num_turns": 4, "is_error": False}))
+                      "num_turns": 4, "is_error": False,
+                      "permission_denials": [{"tool_name": "Write",
+                                              "tool_input": {"file_path": "/etc/x"}}]}))
 """)
 
 
@@ -510,3 +512,14 @@ def test_is_test_file():
     assert mcp.is_test_file("src/app.spec.ts")
     assert mcp.is_test_file("tests/helpers.py")
     assert not mcp.is_test_file("src/testing_utils.py")
+
+
+def test_task_reports_refused_actions(repo, tmp_path):
+    out = run_task(repo, tmp_path)
+    assert "Refused actions" in out
+    assert "Write: /etc/x" in out
+
+
+def test_worker_has_no_unscoped_write_rules():
+    # A bare Edit/Write allow rule lets the worker write outside the project.
+    assert not {"Edit", "Write"} & set(mcp.WORKER_TOOLS)
