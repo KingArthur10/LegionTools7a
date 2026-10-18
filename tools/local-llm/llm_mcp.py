@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""MCP server that hands bulk reading in Claude Code to the local model.
+"""MCP server that hands work in Claude Code to the local model.
 
 Claude passes file paths, this server reads the files itself and asks the local
-model (via llama-swap), and only the short answer goes back into Claude's
-context. That is where the tokens are saved.
+model (via llama-swap), and only a short result goes back into Claude's context.
 
 Tools:
   local_ask     answer a question about files, directories or globs
   local_search  find code by meaning, using the embedding model
+  local_task    have a local Claude Code worker (claude-local) implement a
+                well-specified change, then run the tests and report the diff
 
 Only files under the project directory (the server's working directory, or
 --root) and the system temp directory (or --allow DIRs) are read. Names that look
@@ -16,6 +17,7 @@ like secrets (.env, keys, credentials) are always skipped.
   llm_mcp.py                       # serve MCP over stdio (what Claude Code runs)
   llm_mcp.py ask QUESTION PATH...  # same as the tool, from a shell
   llm_mcp.py search QUERY [PATH]
+  llm_mcp.py task TASK [--file F]... [--test CMD]
 """
 
 from __future__ import annotations
@@ -23,12 +25,16 @@ from __future__ import annotations
 import argparse
 import array
 import base64
+import fcntl
 import fnmatch
 import hashlib
 import json
 import logging
 import os
 import re
+import shlex
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +47,8 @@ from pathlib import Path
 from typing import IO, Any
 
 log = logging.getLogger("llm-mcp")
+
+HERE = Path(__file__).resolve().parent
 
 DEFAULT_URL = "http://127.0.0.1:8080"
 CACHE_DIR = (
@@ -83,6 +91,32 @@ SEARCH_QUERY_PREFIX = (
     "Query: "
 )
 
+TASK_TIMEOUT = 15 * 60
+TASK_MAX_TIMEOUT = 28 * 60  # Claude Code drops a silent stdio tool call after 30 min
+TEST_TIMEOUT = 5 * 60
+TASK_SUMMARY_CHARS = 1500
+TEST_OUTPUT_LINES = 30
+# No bare Edit/Write: a rule without a path allows writing anywhere. acceptEdits mode
+# already approves edits inside the project, and -p mode refuses everything else.
+WORKER_TOOLS = ("Read", "Grep", "Glob")
+# Existing files matching these are protected unless listed as targets: a worker that
+# can't make tests pass tends to rewrite them.
+TEST_FILE_PATTERNS = ("test_*", "*_test.*", "*.test.*", "*.spec.*", "conftest.py")
+# Claude Code session variables: a nested session must not attach to the parent's.
+STRIPPED_ENV_PREFIXES = ("CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_PID", "CLAUDE_EFFORT")
+
+WORKER_PROMPT = """You are implementing one well-specified change in this repository. Another
+engineer will review your diff.
+
+Task:
+{task}
+{files}{tests}
+Rules:
+- Change only what the task needs, following the existing code style.
+- Do not modify existing tests unless the task says so.
+- Do not run git commands or touch files outside this repository.
+- When done, reply with a short summary: files changed, and anything unfinished or uncertain."""
+
 SYSTEM_ASK = """You answer questions about files for another AI assistant that cannot see them.
 Files appear under `=== path (lines a-b of n) ===` headers, each line as `N: text`.
 - Answer only from the files. If the answer is not there, say so plainly.
@@ -100,8 +134,13 @@ citations. Combine them into one answer to the question for another AI assistant
 Keep the citations. If notes conflict, say so. If none answer the question, say the files
 don't contain the answer. Be concise: lead with the answer. No preamble."""
 
-INSTRUCTIONS = """Local model on this machine for bulk reading. Pass file paths, directories or
-globs: the server reads the files itself, so their contents never enter your context.
+INSTRUCTIONS = """Local model on this machine. Pass file paths, directories or globs: the
+server reads the files itself, so their contents never enter your context.
+- local_task: delegate writing code. Give a precise spec (behaviour, file names, interfaces,
+  edge cases) and a test command; a local Claude Code worker implements it and the server
+  runs the tests. Use it for well-specified, self-contained pieces (boilerplate, UI markup,
+  CRUD handlers, tests from a spec), not for security-sensitive or subtle code. Always review
+  the reported diff (git diff) before building on it.
 - local_ask: questions over large or many files: logs, unfamiliar modules, "where/how is X
   done", summaries of a directory. Don't paste content into it; write output to a file and
   pass the path.
@@ -112,6 +151,48 @@ before editing code or stating facts that matter. Read files you are about to ed
 directly, and use Read for a quick look at one small file: that is cheaper and exact."""
 
 TOOLS = [
+    {
+        "name": "local_task",
+        "description": (
+            "Delegate a well-specified code change to a local Claude Code worker running on "
+            "the local model (git repositories only). The worker edits files in the project "
+            "and may run only test_command. Afterwards the server runs test_command itself "
+            "and returns the test result, the changed files with line counts, and the "
+            "worker's summary. Saves your output tokens on code you would otherwise write. "
+            "Review the diff before relying on it. Takes minutes; one task at a time."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "Precise spec: behaviour, files, interfaces, edge cases.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Files to create or change, relative to the project.",
+                },
+                "protect": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Files the worker must not change. Existing test files "
+                    "(test_*, *_test.*, *.spec.*, tests/) are protected automatically unless "
+                    "listed in files.",
+                },
+                "test_command": {
+                    "type": "string",
+                    "description": "Command that verifies the work, e.g. 'uv run pytest tests/'.",
+                },
+                "timeout_minutes": {
+                    "type": "integer",
+                    "description": f"Worker time limit (default {TASK_TIMEOUT // 60}, "
+                    f"max {TASK_MAX_TIMEOUT // 60}).",
+                },
+            },
+            "required": ["task"],
+        },
+    },
     {
         "name": "local_ask",
         "description": (
@@ -631,6 +712,282 @@ def search(
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- local_task
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, check=True, text=True, timeout=60
+    ).stdout
+
+
+def file_state(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except FileNotFoundError:
+        return "deleted"
+    except OSError:
+        return "unreadable"
+
+
+def dirty_files(root: Path) -> dict[str, str]:
+    """Modified, deleted and untracked files (relative paths) with a content fingerprint."""
+    out = git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    entries = out.split("\0")
+    files: dict[str, str] = {}
+    i = 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, name = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            i += 1  # the next entry is the rename/copy source
+        files[name] = file_state(root / name)
+    return files
+
+
+def describe_changes(
+    root: Path, before: dict[str, str], after: dict[str, str], requested: list[str] | None = None
+) -> list[str]:
+    changed = sorted(
+        {name for name, state in after.items() if before.get(name) != state}
+        | {name for name in before if name not in after}  # reverted to the committed version
+    )
+    tracked = set(git(root, "ls-files", "-z").split("\0"))
+    numstat: dict[str, str] = {}
+    if changed:
+        for line in git(root, "diff", "--numstat", "HEAD", "--", *changed).splitlines():
+            added, deleted, name = line.split("\t", 2)
+            numstat[name] = f"+{added} -{deleted}"
+    lines = []
+    for name in changed:
+        if "__pycache__" in Path(name).parts:
+            continue
+        path = root / name
+        if name not in tracked:
+            count = len(read_lines(path)) if path.is_file() and is_text(path) else 0
+            extra = " - NOT REQUESTED" if requested and name not in requested else ""
+            lines.append(f"  A {name} (new, {count} lines){extra}")
+        elif not path.exists():
+            lines.append(f"  D {name}")
+        else:
+            note = " (already modified before the task; diff includes those changes)"
+            lines.append(
+                f"  M {name} ({numstat.get(name, 'no diff vs HEAD')})"
+                + (note if name in before else "")
+            )
+    return lines
+
+
+def tail(text: str, lines: int) -> str:
+    return "\n".join(text.strip().splitlines()[-lines:])
+
+
+def is_test_file(name: str) -> bool:
+    path = Path(name)
+    return "tests" in path.parts[:-1] or any(
+        fnmatch.fnmatch(path.name, pattern) for pattern in TEST_FILE_PATTERNS
+    )
+
+
+def worker_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if not k.startswith(STRIPPED_ENV_PREFIXES)}
+
+
+def run_worker(
+    cmd: list[str], root: Path, timeout: float, progress: Progress
+) -> tuple[str, str, bool]:
+    """Run the worker, reporting progress every 15 s; returns stdout, stderr, timed_out."""
+    start = time.monotonic()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=root,
+        env=worker_env(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,  # own process group, so a timeout kills its children too
+    )
+    while True:
+        elapsed = time.monotonic() - start
+        try:
+            out, err = proc.communicate(timeout=min(15, max(timeout - elapsed, 0.1)))
+            return out, err, False
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout:
+                break
+            progress(int(elapsed), int(timeout), f"worker running ({elapsed:.0f} s)")
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+            out, err = proc.communicate(timeout=10)
+            return out, err, True
+        except subprocess.TimeoutExpired:
+            continue
+        except ProcessLookupError:
+            break
+    out, err = proc.communicate()
+    return out, err, True
+
+
+def run_tests(command: list[str], root: Path) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=root,
+            env=worker_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=TEST_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {TEST_TIMEOUT} s"
+    except OSError as e:
+        return False, f"could not run: {e}"
+    return proc.returncode == 0, f"exit {proc.returncode}\n" + tail(
+        proc.stdout + proc.stderr, TEST_OUTPUT_LINES
+    )
+
+
+def task(
+    ws: Workspace,
+    spec: str,
+    files: list[str],
+    test_command: str,
+    model: str,
+    timeout_minutes: int = TASK_TIMEOUT // 60,
+    progress: Progress = no_progress,
+    worker: list[str] | None = None,
+    lock_dir: Path = CACHE_DIR,
+    protect: list[str] | None = None,
+) -> str:
+    if not spec.strip():
+        raise ToolError("task is empty")
+    try:
+        git(ws.root, "rev-parse", "--verify", "HEAD")
+    except (subprocess.SubprocessError, OSError) as e:
+        raise ToolError(
+            f"{ws.root} is not a git repository with a commit: local_task needs git so the "
+            "worker's changes can be reviewed and undone"
+        ) from e
+    names = []
+    for spec_path in files:
+        path = ws.resolve(spec_path)
+        if not path.is_relative_to(ws.root) or is_secret(path):
+            raise ToolError(f"{spec_path}: the worker may only change project files")
+        names.append(ws.display(path))
+    protected = {ws.display(ws.resolve(p)) for p in protect or []}
+    protected |= {
+        n for n in git(ws.root, "ls-files", "-z", "-co", "--exclude-standard").split("\0")
+        if n and is_test_file(n) and n not in names
+    }  # fmt: skip
+    test_argv = shlex.split(test_command) if test_command.strip() else []
+    if test_argv and not shutil.which(test_argv[0]):
+        raise ToolError(f"test command not found: {test_argv[0]}")
+    timeout = max(1, min(timeout_minutes, TASK_MAX_TIMEOUT // 60)) * 60
+
+    prompt = WORKER_PROMPT.format(
+        task=spec.strip(),
+        files=(
+            f"\nFiles to create or change: {', '.join(names)}. Do not create any other files "
+            "(no helper or scratch scripts).\n"
+            if names
+            else ""
+        ),
+        tests=(
+            f"\nCheck your work by running `{test_command}` and fix failures until it passes.\n"
+            if test_argv
+            else ""
+        ),
+    )
+    allowed = list(WORKER_TOOLS)
+    if test_argv:
+        allowed += [f"Bash({test_command})", f"Bash({test_command}:*)"]
+    denied = [f"{tool}({name})" for name in sorted(protected) for tool in ("Edit", "Write")]
+    cmd = [*(worker or [str(HERE / "claude-local.sh"), "--model", model])]
+    cmd += ["-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits"]
+    cmd += ["--strict-mcp-config", "--no-session-persistence"]
+    if denied:
+        cmd += ["--disallowedTools", *denied]
+    cmd += ["--allowedTools", *allowed]
+
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / "task.lock").open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise ToolError("another local_task is running; the local model serves one") from e
+        start = time.monotonic()
+        before = dirty_files(ws.root)
+        saved = {n: (ws.root / n).read_bytes() for n in protected if (ws.root / n).is_file()}
+        progress(0, timeout, "starting worker")
+        out, err, timed_out = run_worker(cmd, ws.root, timeout, progress)
+        minutes = (time.monotonic() - start) / 60
+        restored = []
+        for name, content in sorted(saved.items()):
+            path = ws.root / name
+            if not path.is_file() or path.read_bytes() != content:
+                path.write_bytes(content)
+                restored.append(name)
+        changes = describe_changes(ws.root, before, dirty_files(ws.root), names)
+        if test_argv:
+            progress(timeout, timeout, "running tests")
+            passed, test_out = run_tests(test_argv, ws.root)
+
+    try:
+        result = json.loads(out)
+        summary = str(result.get("result") or "").strip()
+        turns = result.get("num_turns", "?")
+        denials = sorted(
+            {
+                f"{d.get('tool_name')}: "
+                + str((d.get("tool_input") or {}).get("file_path")
+                      or (d.get("tool_input") or {}).get("command") or "?")[:120]
+                for d in result.get("permission_denials") or []
+            }
+        )  # fmt: skip
+        status = "error" if result.get("is_error") else "finished"
+    except ValueError:
+        denials = []
+        # Not JSON: crashed or killed. Show stderr minus claude-local's start-up lines.
+        noise = ("claude-local:", "⚠", "[claude-code:")
+        lines = [ln for ln in (err or out).splitlines() if not ln.startswith(noise)]
+        summary = tail("\n".join(lines), 15)
+        turns = "?"
+        status = "failed to start or crashed"
+    if timed_out:
+        status = f"stopped at the {timeout // 60}-min limit"
+
+    parts = [f"[local task · {model} · {minutes:.1f} min · {turns} turns · worker {status}]"]
+    if restored:
+        parts.append(
+            "WARNING: the worker changed protected files; the server restored them: "
+            + ", ".join(restored)
+            + ". Treat its result with extra suspicion."
+        )
+    if test_argv:
+        verdict = "PASSED" if passed else "FAILED"
+        parts.append(f"Tests (`{test_command}`, run by the server): {verdict}, {test_out}")
+    else:
+        parts.append("Tests: none given, so nothing was verified.")
+    parts.append("Changed files:\n" + ("\n".join(changes) if changes else "  (none)"))
+    if denials:
+        parts.append(
+            "Refused actions (outside the project, protected or not allowed):\n"
+            + "\n".join(f"  {d}" for d in denials)
+        )
+    if len(summary) > TASK_SUMMARY_CHARS:
+        summary = summary[:TASK_SUMMARY_CHARS] + " [...]"
+    parts.append("Worker summary:\n" + (summary or "(none)"))
+    parts.append("Review the diff (git diff) before building on it.")
+    return "\n\n".join(parts)
+
+
 # --------------------------------------------------------------------------- MCP server
 
 
@@ -719,6 +1076,15 @@ class Server:
                     self.client, self.ws, str(args.get("question", "")),
                     [str(p) for p in args.get("paths") or []], progress,
                 ), False  # fmt: skip
+            if name == "local_task":
+                return task(
+                    self.ws, str(args.get("task", "")),
+                    [str(p) for p in args.get("files") or []],
+                    str(args.get("test_command") or ""), self.client.model,
+                    int(args.get("timeout_minutes") or TASK_TIMEOUT // 60),
+                    progress, lock_dir=self.cache_dir,
+                    protect=[str(p) for p in args.get("protect") or []],
+                ), False  # fmt: skip
             if name == "local_search":
                 return search(
                     self.client, self.ws, str(args.get("query", "")),
@@ -770,6 +1136,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("query")
     p_search.add_argument("path", nargs="?", default=".")
     p_search.add_argument("-n", "--limit", type=int, default=8)
+    p_task = sub.add_parser("task", help="run local_task from the shell")
+    p_task.add_argument("task")
+    p_task.add_argument("--file", action="append", default=[], dest="files")
+    p_task.add_argument(
+        "--protect", action="append", default=[], help="file the worker must not change"
+    )
+    p_task.add_argument("--test", default="", help="test command run by the worker and after")
+    p_task.add_argument("--timeout", type=int, default=TASK_TIMEOUT // 60, help="minutes")
     return parser
 
 
@@ -791,6 +1165,11 @@ def main(argv: list[str] | None = None) -> int:
             print(ask(client, ws, args.question, args.paths, show))
         elif args.command == "search":
             print(search(client, ws, args.query, args.path, args.limit, show))
+        elif args.command == "task":
+            print(
+                task(ws, args.task, args.files, args.test, client.model, args.timeout, show,
+                     protect=args.protect)
+            )  # fmt: skip
         else:
             Server(client, ws, sys.stdout).serve(sys.stdin)
     except ToolError as e:
