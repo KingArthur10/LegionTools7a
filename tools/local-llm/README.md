@@ -5,8 +5,9 @@
 Run local LLMs on the Radeon 8060S (Strix Halo, `gfx1151`) with **llama.cpp**, for
 use as a local tool from Claude Code (MCP) and as an offline Claude Code backend.
 This directory covers the engine, the model files, benchmarking and a local
-endpoint (llama-swap as a system service) plus `claude-local`, which runs Claude
-Code entirely on a local model; the MCP tool is a later phase.
+endpoint (llama-swap as a system service), an MCP server that lets Claude Code
+hand bulk reading to the local model (`llm_mcp.py`), and `claude-local`, which
+runs Claude Code entirely on a local model.
 
 Why llama.cpp rather than Ollama: both of our workloads are dominated by long
 prompts (Claude Code's system prompt + tool schemas, or large files/logs for the
@@ -103,6 +104,37 @@ journalctl -u llama-swap -f          # load/unload and server logs
 ```
 
 The first request to a model waits for it to load (up to `healthCheckTimeout`).
+
+### Local tools inside Claude Code (MCP)
+
+`llm_mcp.py` is an MCP server (standard library only) that Claude Code calls to
+hand bulky reading to the local model. Claude passes **paths**; the server reads
+the files itself, so their contents never enter Claude's context. Only the short
+answer does.
+
+| Tool | Does |
+| ---- | ---- |
+| `local_ask(question, paths)` | Answers a question about files, directories or globs with `path:line` citations. Input larger than the 64K context is split; each part is read for notes and the notes are combined |
+| `local_search(query, path?)` | Semantic search with `embed`. Returns `path:start-end` ranges plus a one-line preview. The index is cached in `~/.cache/legiontools7a/llm-mcp/` and only changed files are re-embedded |
+
+```bash
+claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in every project
+./llm_mcp.py ask "where is the context size read?" claude-local.sh   # same as the tool, from a shell
+./llm_mcp.py search "SHA-256 check of model files"
+```
+
+- **What it reads:** files under the project (Claude Code's working directory, or
+  `--root`) and the temp directory (`--allow DIR` adds more). Directories follow
+  `.gitignore`. Secret-looking names (`.env*`, keys, `*credentials*`, `*secret*`,
+  `~/.ssh`) and binaries are skipped, and the answer lists what was skipped.
+- **Limits:** about 250K tokens per call (roughly 4 minutes of reading); narrow
+  the paths beyond that. llama-swap serves one request at a time, so parallel
+  calls queue. After 30 minutes idle, the first call waits ~10 s for the model
+  to load.
+- **Trust:** answers come from a 30B model. The server's instructions tell Claude
+  to treat them as leads and to read cited lines itself before editing.
+- **Skip it under `claude-local`:** there the "local tool" is the same model
+  Claude Code already runs on.
 
 ### Claude Code on a local model
 
