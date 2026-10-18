@@ -1,7 +1,9 @@
 import importlib.util
 import io
 import json
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -302,7 +304,7 @@ def test_notifications_get_no_response(server):
 
 def test_tools_list(server):
     tools = rpc(server, "tools/list")["result"]["tools"]
-    assert [t["name"] for t in tools] == ["local_ask", "local_search"]
+    assert [t["name"] for t in tools] == ["local_task", "local_ask", "local_search"]
 
 
 def test_unknown_method_and_invalid_request(server):
@@ -344,3 +346,167 @@ def test_serve_loop_parse_error_and_responses(project, tmp_path):
     assert replies[0]["error"]["code"] == -32700
     assert replies[1] == {"jsonrpc": "2.0", "id": 7, "result": {}}
     assert len(replies) == 2
+
+
+# --------------------------------------------------------------------------- local_task
+
+FAKE_WORKER = textwrap.dedent("""
+    import json, os, sys, time
+    from pathlib import Path
+    prompt = sys.argv[sys.argv.index("-p") + 1]
+    mode = os.environ.get("FAKE_MODE", "ok")
+    Path("env.txt").write_text(" ".join(sorted(k for k in os.environ if "CLAUDE" in k)))
+    if mode == "sleep":
+        time.sleep(60)
+    if mode == "crash":
+        sys.exit("boom")
+    if mode == "cheat":
+        Path("test_calc.py").write_text("def test_nothing():\\n    pass\\n")
+    if "--disallowedTools" in sys.argv:
+        Path("denied.txt").write_text(sys.argv[sys.argv.index("--disallowedTools") + 1])
+    Path("calc.py").write_text("def add(a, b):\\n    return a + b\\n")
+    Path("README.md").write_text("changed\\n")
+    Path("scratch.py").write_text("print(1)\\n")
+    print(json.dumps({"result": "Added add() in calc.py. PROMPT=" + prompt[:40],
+                      "num_turns": 4, "is_error": False}))
+""")
+
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    for cmd in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", "-C", str(root), *cmd], check=True)
+    (root / "README.md").write_text("hello\n")
+    (root / "notes.txt").write_text("draft\n")
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "init"], check=True)
+    (root / "notes.txt").write_text("edited by the user\n")  # dirty before the task
+    (root / "test_calc.py").write_text("from calc import add\ndef test_add():\n"
+                                       "    assert add(2, 3) == 5\n")  # fmt: skip
+    worker = tmp_path / "worker.py"
+    worker.write_text(FAKE_WORKER)
+    monkeypatch.setenv("CLAUDECODE", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent")
+    return root, [sys.executable, str(worker)]
+
+
+def run_task(repo, tmp_path, **kw):
+    root, worker = repo
+    kw.setdefault("files", ["calc.py"])
+    kw.setdefault("test_command", f"{sys.executable} -m pytest -q test_calc.py")
+    return mcp.task(mcp.Workspace(root), kw.pop("spec", "add add()"), model="fake",
+                    worker=worker, lock_dir=tmp_path / "lock", **kw)  # fmt: skip
+
+
+def test_task_reports_tests_and_changes(repo, tmp_path):
+    out = run_task(repo, tmp_path)
+    assert "worker finished" in out
+    assert "4 turns" in out
+    assert "PASSED" in out
+    assert "A calc.py (new, 2 lines)" in out
+    assert "M README.md (+1 -1)" in out
+    assert "A scratch.py (new, 1 lines) - NOT REQUESTED" in out
+    changes = out.split("Changed files:")[1].split("Worker summary:")[0]
+    assert "notes.txt" not in changes  # dirty before, untouched by the worker
+    assert "test_calc.py" not in changes
+    assert "Added add() in calc.py" in out
+
+
+def test_task_prompt_lists_files_and_tests(repo, tmp_path):
+    out = run_task(repo, tmp_path)
+    assert "PROMPT=You are implementing one well-specified" in out
+
+
+def test_task_failed_tests(repo, tmp_path):
+    (repo[0] / "test_calc.py").write_text("def test_fail():\n    assert False\n")
+    assert "FAILED, exit 1" in run_task(repo, tmp_path)
+
+
+def test_task_strips_claude_session_env(repo, tmp_path):
+    run_task(repo, tmp_path)
+    assert (repo[0] / "env.txt").read_text() == ""
+
+
+def test_run_worker_timeout_kills_process(tmp_path):
+    start = mcp.time.monotonic()
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    _, _, timed_out = mcp.run_worker(cmd, tmp_path, 1, mcp.no_progress)
+    assert timed_out
+    assert mcp.time.monotonic() - start < 15
+
+
+def test_task_worker_crash(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "crash")
+    out = run_task(repo, tmp_path)
+    assert "failed to start or crashed" in out
+    assert "boom" in out
+    assert "FAILED" in out  # calc.py was never written
+
+
+def test_task_without_tests_says_unverified(repo, tmp_path):
+    assert "nothing was verified" in run_task(repo, tmp_path, test_command="")
+
+
+def test_task_rejects_files_outside_project(repo, tmp_path):
+    with pytest.raises(mcp.ToolError, match=r"outside|only change project files"):
+        run_task(repo, tmp_path, files=[str(tmp_path / "elsewhere.py")])
+
+
+def test_task_needs_git(project, tmp_path):
+    with pytest.raises(mcp.ToolError, match="not a git repository"):
+        mcp.task(mcp.Workspace(project), "x", [], "", "fake", lock_dir=tmp_path)
+
+
+def test_task_one_at_a_time(repo, tmp_path):
+    lock_dir = tmp_path / "lock"
+    lock_dir.mkdir()
+    with (lock_dir / "task.lock").open("w") as held:
+        mcp.fcntl.flock(held, mcp.fcntl.LOCK_EX | mcp.fcntl.LOCK_NB)
+        with pytest.raises(mcp.ToolError, match="another local_task"):
+            run_task(repo, tmp_path)
+
+
+def test_dirty_files_handles_renames(repo):
+    root, _ = repo
+    subprocess.run(["git", "-C", str(root), "mv", "README.md", "READ.md"], check=True)
+    files = mcp.dirty_files(root)
+    assert "READ.md" in files
+    assert "README.md" not in files
+
+
+def test_task_restores_protected_test_files(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "cheat")
+    root, _ = repo
+    original = (root / "test_calc.py").read_text()
+    out = run_task(repo, tmp_path)
+    assert "WARNING: the worker changed protected files" in out
+    assert "test_calc.py" in out.split("WARNING")[1].split("\n")[0]
+    assert (root / "test_calc.py").read_text() == original
+    assert (root / "denied.txt").read_text() == "Edit(test_calc.py)"
+
+
+def test_task_test_files_listed_as_targets_are_not_protected(repo, tmp_path):
+    root, _ = repo
+    run_task(repo, tmp_path, files=["calc.py", "test_calc.py"])
+    assert not (root / "denied.txt").exists()
+
+
+def test_task_explicit_protect(repo, tmp_path):
+    root, _ = repo
+    out = run_task(repo, tmp_path, protect=["README.md"])
+    assert "restored them: README.md" in out
+    assert (root / "README.md").read_text() == "hello\n"
+
+
+def test_task_missing_test_command(repo, tmp_path):
+    with pytest.raises(mcp.ToolError, match="test command not found"):
+        run_task(repo, tmp_path, test_command="no-such-binary-xyz -q")
+
+
+def test_is_test_file():
+    assert mcp.is_test_file("test_x.py")
+    assert mcp.is_test_file("src/app.spec.ts")
+    assert mcp.is_test_file("tests/helpers.py")
+    assert not mcp.is_test_file("src/testing_utils.py")

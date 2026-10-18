@@ -6,8 +6,8 @@ Run local LLMs on the Radeon 8060S (Strix Halo, `gfx1151`) with **llama.cpp**, f
 use as a local tool from Claude Code (MCP) and as an offline Claude Code backend.
 This directory covers the engine, the model files, benchmarking and a local
 endpoint (llama-swap as a system service), an MCP server that lets Claude Code
-hand bulk reading to the local model (`llm_mcp.py`), and `claude-local`, which
-runs Claude Code entirely on a local model.
+hand work to the local model (`llm_mcp.py`), and `claude-local`, which runs
+Claude Code entirely on a local model.
 
 Why llama.cpp rather than Ollama: both of our workloads are dominated by long
 prompts (Claude Code's system prompt + tool schemas, or large files/logs for the
@@ -108,17 +108,19 @@ The first request to a model waits for it to load (up to `healthCheckTimeout`).
 ### Local tools inside Claude Code (MCP)
 
 `llm_mcp.py` is an MCP server (standard library only) that Claude Code calls to
-hand bulky reading to the local model. Claude passes **paths**; the server reads
-the files itself, so their contents never enter Claude's context. Only the short
-answer does.
+hand work to the local model. Claude passes **paths**, never file contents, and
+gets back a short result.
 
 | Tool | Does |
 | ---- | ---- |
+| `local_task(task, files?, test_command?, protect?)` | Runs a `claude-local` worker in the project to implement a well-specified change, then runs `test_command` itself and reports the result, the changed files (+/− lines) and the worker's summary. Saves Claude the output tokens of writing the code |
 | `local_ask(question, paths)` | Answers a question about files, directories or globs with `path:line` citations. Input larger than the 64K context is split; each part is read for notes and the notes are combined |
 | `local_search(query, path?)` | Semantic search with `embed`. Returns `path:start-end` ranges plus a one-line preview. The index is cached in `~/.cache/legiontools7a/llm-mcp/` and only changed files are re-embedded. One call embeds at most ~1,200 new chunks (~1 min); a bigger first index says it is incomplete and continues on the next call. Files over 300 KB are left out |
 
 ```bash
 claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in every project
+./llm_mcp.py task "Create ram_store.py with class RamChatStore ..." \
+    --file ram_store.py --test "uv run pytest -q test_ram_store.py"   # local_task from a shell
 ./llm_mcp.py ask "where is the context size read?" claude-local.sh   # same as the tool, from a shell
 ./llm_mcp.py search "SHA-256 check of model files"
 ```
@@ -133,7 +135,21 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
   to load.
 - **Trust:** answers come from a 30B model. The server's instructions tell Claude
   to treat them as leads and to read cited lines itself before editing.
-- **Measured:** in A/B runs it saved Opus no tokens: Opus already greps and reads
+- **`local_task` workflow:** Claude writes the spec and the tests, the worker
+  implements, and Claude reviews `git diff`. Rules the server enforces:
+  - git repositories only (with a commit), so changes can be reviewed and undone;
+  - the worker may edit files and run only `test_command`; it gets no MCP
+    servers (no recursion) and runs in `acceptEdits` mode, so edits need no approval;
+  - existing test files (`test_*`, `*_test.*`, `*.spec.*`, `tests/`) and any
+    `protect` paths are denied to the worker, and if one changes anyway the server
+    restores it and puts a warning at the top of the report;
+  - new files outside `files` are flagged `NOT REQUESTED`;
+  - one task at a time, 15 min by default (max 28: Claude Code drops a silent
+    stdio call after 30), with progress messages every 15 s.
+  First real run (in-memory chat store, 5 spec tests): 2.6 min, tests passed.
+  Before protection existed, a worker facing a broken test command rewrote the
+  spec's tests to make them pass, which is why they're protected now.
+- **Measured (reading tools):** in A/B runs `local_ask` saved Opus no tokens: Opus already greps and reads
   only what it needs, and the local model was slower and missed a root cause in
   a long log. It is installed as an optional tool, not recommended to Claude. See
   [docs/local-llm-benchmarks.md](../../docs/local-llm-benchmarks.md#hybrid-reading-via-mcp-2026-10-18).
