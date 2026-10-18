@@ -8,6 +8,9 @@
 # NAME is a model from llama-swap.yaml (default: qwen3-coder). Every model role
 # (main, Haiku/Sonnet/Opus aliases, subagents) uses it, because llama-swap keeps
 # one chat model loaded and switching roles would reload it on every call.
+# Starts in the default (ask-first) permission mode unless you pass
+# --permission-mode: auto mode's safety classifier would run on the local model,
+# which is too slow (it times out and denies) and too weak to trust.
 # Env: LOCAL_LLM_URL (default http://127.0.0.1:8080), LOCAL_LLM_MODEL.
 set -euo pipefail
 
@@ -16,7 +19,7 @@ model=${LOCAL_LLM_MODEL:-qwen3-coder}
 max_output=8192 # Claude Code reserves 32K by default: half of a 64K window
 
 usage() {
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 die() {
@@ -38,6 +41,7 @@ context_size() {
 }
 
 print_env=0
+permission_mode_set=0
 claude_args=()
 while (($#)); do
     case $1 in
@@ -59,6 +63,11 @@ while (($#)); do
         exit 0
         ;;
     -h | --help) usage 0 ;;
+    --permission-mode | --permission-mode=* | --dangerously-skip-permissions)
+        permission_mode_set=1
+        claude_args+=("$1")
+        shift
+        ;;
     *)
         claude_args+=("$1")
         shift
@@ -93,6 +102,8 @@ if ((print_env)); then
     for v in "${vars[@]}"; do printf 'export %s=%q\n' "${v%%=*}" "${v#*=}"; done
     exit 0
 fi
+
+((permission_mode_set)) || claude_args=(--permission-mode default "${claude_args[@]}")
 
 printf 'claude-local: %s, %s-token context, via %s\n' "$model" "$ctx" "$url" >&2
 exec env -u ANTHROPIC_API_KEY "${vars[@]}" claude "${claude_args[@]}"

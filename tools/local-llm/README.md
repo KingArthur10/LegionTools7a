@@ -129,6 +129,10 @@ It checks the endpoint is up, loads the model, and sets:
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the server's real context (read from `/upstream/<model>/props`); otherwise Claude Code assumes 200K and never compacts in time |
 | `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` | the default 32K output reservation is half of a 64K window |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_COST_WARNINGS` | no telemetry; the cost shown is meaningless for a local model |
+| `--permission-mode default` (unless you pass your own) | auto mode's safety classifier would run on the local model: each check took over Claude Code's 60 s limit and was denied, and a small local model shouldn't be trusted to judge risk anyway |
+
+`--env` prints only the environment variables, so a `claude` started that way
+keeps your configured permission mode. Add `--permission-mode default` yourself.
 
 Expected noise: an `unrecognized_model` line and a note that claude.ai connectors
 are disabled (they need your claude.ai login, which isn't used here). `/model`
@@ -137,6 +141,25 @@ works, but switching to the other chat model reloads it (~10 s).
 Tested on Claude Code 2.1.292: both models complete an edit → run tests → fix loop
 (10/10 tests). Claude Code's own system prompt and tools take ~10K tokens of the
 64K context. Prompt caching works: llama-server reuses the shared prefix.
+
+### Working offline
+
+`claude-local` runs Claude Code with no internet connection. Tested with
+networking off (`nmcli networking off`) on Claude Code 2.1.292: start-up, a
+multi-step write → test → fix session and tool approvals all worked. A debug log
+of a run with no network showed connections to `127.0.0.1` only: no Anthropic
+API, telemetry or update checks.
+
+Checklist:
+
+- `systemctl is-active llama-swap` reports `active`. The service starts at boot.
+- The models are in `/srv/llm/models` (`./download-models.sh` needs the network).
+- Start with `claude-local`, not `claude`: plain `claude` still talks to Anthropic.
+- The first reply takes ~30–40 s while the model reads Claude Code's system
+  prompt. Later turns reuse it from the cache.
+- Not available offline: claude.ai connectors, web search/fetch, and any MCP
+  server that calls an online service.
+- `llm_bench.py` and `llm_eval.py` have no dependencies, so `uv run` works offline.
 
 ## Notes
 
