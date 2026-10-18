@@ -1,0 +1,33 @@
+[Unit]
+Description=llama-swap: local LLM endpoint (llama.cpp, Vulkan)
+Documentation=https://github.com/KingArthur10/LegionTools7a/tree/main/tools/local-llm
+After=network.target
+
+[Service]
+Type=simple
+User=llm
+Group=llm
+SupplementaryGroups=render video
+# Loopback only: llama-swap's default (:8080) would listen on every interface.
+ExecStart=/opt/llama-swap/llama-swap -config /etc/llama-swap/config.yaml -listen 127.0.0.1:8080
+Restart=on-failure
+RestartSec=5
+# Writable state and Mesa's shader cache (the service otherwise sees a read-only FS).
+StateDirectory=llm
+CacheDirectory=llm
+Environment=HOME=/var/lib/llm XDG_CACHE_HOME=/var/cache/llm
+
+# Hardening. Models are read from /srv/llm/models (read-only under ProtectSystem).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

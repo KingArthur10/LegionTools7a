@@ -1,0 +1,66 @@
+# llama-swap config: one local endpoint (127.0.0.1:8080) for all local models.
+# Installed to /etc/llama-swap/config.yaml by install-server.sh.
+#
+# OpenAI:    POST /v1/chat/completions, /v1/embeddings   {"model": "<name>"}
+# Anthropic: POST /v1/messages, /v1/messages/count_tokens
+# Choices and numbers come from docs/local-llm-benchmarks.md.
+
+healthCheckTimeout: 300 # seconds to wait for a model to load
+logLevel: info
+startPort: 10001
+
+macros:
+  # Vulkan build (faster generation than ROCm here; no ROCm runtime needed).
+  # Flash attention + q8_0 KV cache; all layers on the GPU; one request at a time.
+  "server": >
+    /opt/llama.cpp/bin/llama-server
+    --host 127.0.0.1 --port ${PORT}
+    -ngl 99 -fa on -ctk q8_0 -ctv q8_0
+    -np 1 --jinja --no-webui
+  "models": "/srv/llm/models"
+
+models:
+  "qwen3-coder":
+    name: "Qwen3-Coder 30B-A3B (Q4_K_M)"
+    description: "Default: fast, non-thinking; 21/21 on the local eval"
+    cmd: |
+      ${server}
+      -m ${models}/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+      -c 65536
+    ttl: 1800
+
+  "agentworld":
+    name: "Qwen-AgentWorld 35B-A3B (UD-Q5_K_M)"
+    description: "Thinking model; candidate for long agentic sessions"
+    cmd: |
+      ${server}
+      -m ${models}/unsloth/Qwen-AgentWorld-35B-A3B-GGUF/Qwen-AgentWorld-35B-A3B-UD-Q5_K_M.gguf
+      -c 65536
+      --chat-template-file /etc/llama-swap/templates/agentworld.jinja
+    ttl: 1800
+
+  "embed":
+    name: "Qwen3-Embedding 0.6B (Q8_0)"
+    description: "Text/code embeddings for semantic search"
+    cmd: |
+      ${server}
+      -m ${models}/Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
+      --embedding --pooling last -c 8192 -ub 8192
+    ttl: 0 # small (0.6 GB); stays loaded
+
+routing:
+  router:
+    use: group
+    settings:
+      groups:
+        # Large chat models: one at a time, and loading one leaves `embed` alone.
+        "chat":
+          swap: true
+          exclusive: false
+          members: ["qwen3-coder", "agentworld"]
+        # Embeddings stay resident next to whichever chat model is loaded.
+        "embeddings":
+          persistent: true
+          swap: false
+          exclusive: false
+          members: ["embed"]
