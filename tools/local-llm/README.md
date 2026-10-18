@@ -142,6 +142,25 @@ Tested on Claude Code 2.1.292: both models complete an edit → run tests → fi
 (10/10 tests). Claude Code's own system prompt and tools take ~10K tokens of the
 64K context. Prompt caching works: llama-server reuses the shared prefix.
 
+### Working offline
+
+`claude-local` runs Claude Code with no internet connection. Tested with
+networking off (`nmcli networking off`) on Claude Code 2.1.292: start-up, a
+multi-step write → test → fix session and tool approvals all worked. A debug log
+of a run with no network showed connections to `127.0.0.1` only: no Anthropic
+API, telemetry or update checks.
+
+Checklist:
+
+- `systemctl is-active llama-swap` reports `active`. The service starts at boot.
+- The models are in `/srv/llm/models` (`./download-models.sh` needs the network).
+- Start with `claude-local`, not `claude`: plain `claude` still talks to Anthropic.
+- The first reply takes ~30–40 s while the model reads Claude Code's system
+  prompt. Later turns reuse it from the cache.
+- Not available offline: claude.ai connectors, web search/fetch, and any MCP
+  server that calls an online service.
+- `llm_bench.py` and `llm_eval.py` have no dependencies, so `uv run` works offline.
+
 ## Notes
 
 - **`templates/agentworld.jinja`**: Claude Code sends a `system` message in the
