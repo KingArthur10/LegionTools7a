@@ -149,7 +149,8 @@ Through llama-server with `-np 2 -c 131072` (a short chat prompt, 300 tokens):
   Qwen3-Coder only activates ~3B parameters per token.
 - **Default: `-np 2`** for `qwen3-coder`, 64K context per slot. More slots
   trade per-request latency for throughput that nothing here uses yet.
-- **The MCP server is still serial.** `llm_mcp.py` handles one `tools/call` at a
-  time, so parallel tool calls from Claude Code still queue there. The second
-  slot helps today when two clients share llama-swap (e.g. `claude-local` while
-  the MCP server is busy).
+- **The MCP server had to go concurrent too.** `llm_mcp.py` handled one
+  `tools/call` at a time, so parallel calls queued there regardless of slots. It
+  now runs calls on threads: two `local_ask` calls through the real server took
+  2.2 s together instead of 3.4 s one after the other (warm prompt cache, so
+  generation-bound).
