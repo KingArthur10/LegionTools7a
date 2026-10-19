@@ -118,3 +118,38 @@ input) and gave the wrong start time. Opus with grep got all three right in 15 s
 - **Conclusion:** keep `local_ask` / `local_search` as optional tools (no
   `CLAUDE.md` nudge, no `alwaysLoad`). The hybrid effort moves to output: having
   the local model *write* well-specified code with tests, Opus reviewing.
+
+## Parallel request slots (2026-10-19)
+
+Can Qwen3-Coder serve more than one request at a time? `llama-batched-bench`
+(Vulkan, q8_0 KV, flash attention), 256 generated tokens per sequence:
+
+| Prompt | Parallel | Prefill tok/s (total) | Generation tok/s (total) | Per request |
+| -----: | :-: | --: | --: | --: |
+| 4,096 | 1 | 1,124 | 78.5 | 78.5 |
+| 4,096 | 2 | 1,184 | 111.9 | 55.9 |
+| 4,096 | 3 | 1,180 | 132.2 | 44.1 |
+| 4,096 | 4 | 1,177 | 151.5 | 37.9 |
+| 16,384 | 1 | 758 | 63.1 | 63.1 |
+| 16,384 | 2 | 758 | 80.6 | 40.3 |
+
+Through llama-server with `-np 2 -c 131072` (a short chat prompt, 300 tokens):
+89 tok/s alone, 2 × 63 = 126 tok/s for two at once. GTT in use: 25.3 GiB
+(desktop included) with the model and both 64K slots loaded.
+
+### Findings
+
+- **Generation scales, prefill doesn't.** Two requests decode in one batch and
+  share each read of the weights: 1.4× total at 2, 1.9× at 4. Prefill is
+  compute-bound and already batched, so it stays flat; at 16K-token prompts two
+  parallel requests finish only ~4% sooner than two in sequence.
+- **Slots are cheap; a second model isn't.** A slot costs only KV cache (~3 GB
+  per 64K at q8_0). A second model splits the same ~256 GB/s of bandwidth
+  instead of sharing weight reads, and smaller models aren't faster here:
+  Qwen3-Coder only activates ~3B parameters per token.
+- **Default: `-np 2`** for `qwen3-coder`, 64K context per slot. More slots
+  trade per-request latency for throughput that nothing here uses yet.
+- **The MCP server is still serial.** `llm_mcp.py` handles one `tools/call` at a
+  time, so parallel tool calls from Claude Code still queue there. The second
+  slot helps today when two clients share llama-swap (e.g. `claude-local` while
+  the MCP server is busy).

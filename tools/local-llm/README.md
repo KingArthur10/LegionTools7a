@@ -30,7 +30,7 @@ Fedora's ROCm 7.1.1 already ships `gfx1151` kernels for rocBLAS and hipBLASLt.
 
 ```bash
 ./build-llama-cpp.sh            # both backends (rocm | vulkan | all)
-./download-models.sh            # tier-1 models from models.tsv (~97 GB)
+./download-models.sh            # tier-1 models from models.tsv (~132 GB)
 ./download-models.sh all        # every tier
 ./llm_bench.py speed            # llama-bench every model on both backends
 ./llm_eval.py run               # graded coding tasks (results: docs/local-llm-benchmarks.md)
@@ -131,8 +131,9 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
   `~/.ssh`) and binaries are skipped, and the answer lists what was skipped.
 - **Limits:** 100K tokens per call, counted with the model's tokenizer. Reading
   runs at ~370 tokens/s, so that is 4-5 minutes; narrow the paths beyond that.
-  llama-swap serves one request at a time, so parallel calls queue. After 30 minutes idle, the first call waits ~10 s for the model
-  to load.
+  `qwen3-coder` serves two requests at once (`-np 2`), but the MCP server handles
+  one tool call at a time, so parallel tool calls queue. After 30 minutes idle,
+  the first call waits ~10 s for the model to load.
 - **Trust:** answers come from a 30B model. The server's instructions tell Claude
   to treat them as leads and to read cited lines itself before editing.
 - **`local_task` workflow:** Claude writes the spec and the tests, the worker

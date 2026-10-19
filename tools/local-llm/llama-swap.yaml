@@ -11,22 +11,25 @@ startPort: 10001
 
 macros:
   # Vulkan build (faster generation than ROCm here; no ROCm runtime needed).
-  # Flash attention + q8_0 KV cache; all layers on the GPU; one request at a time.
+  # Flash attention + q8_0 KV cache; all layers on the GPU. Each model sets its own
+  # request slots (-np); llama-server splits -c evenly across them.
   "server": >
     /opt/llama.cpp/bin/llama-server
     --host 127.0.0.1 --port ${PORT}
     -ngl 99 -fa on -ctk q8_0 -ctv q8_0
-    -np 1 --jinja --no-webui
+    --jinja --no-webui
   "models": "/srv/llm/models"
 
 models:
   "qwen3-coder":
     name: "Qwen3-Coder 30B-A3B (Q4_K_M)"
     description: "Default: fast, non-thinking; 21/21 on the local eval"
+    # Two parallel requests at 64K context each (+~3 GB KV cache): ~1.4x total
+    # generation throughput, each request ~30% slower (docs/local-llm-benchmarks.md).
     cmd: |
       ${server}
       -m ${models}/unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
-      -c 65536
+      -np 2 -c 131072
     ttl: 1800
 
   "agentworld":
@@ -35,7 +38,7 @@ models:
     cmd: |
       ${server}
       -m ${models}/unsloth/Qwen-AgentWorld-35B-A3B-GGUF/Qwen-AgentWorld-35B-A3B-UD-Q5_K_M.gguf
-      -c 65536
+      -np 1 -c 65536
       --chat-template-file /etc/llama-swap/templates/agentworld.jinja
     ttl: 1800
 
@@ -45,7 +48,7 @@ models:
     cmd: |
       ${server}
       -m ${models}/Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf
-      --embedding --pooling last -c 8192 -ub 8192
+      --embedding --pooling last -np 1 -c 8192 -ub 8192
     ttl: 0 # small (0.6 GB); stays loaded
 
 routing:
