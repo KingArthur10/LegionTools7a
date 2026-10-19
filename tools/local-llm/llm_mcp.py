@@ -38,10 +38,13 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
@@ -55,7 +58,7 @@ CACHE_DIR = (
     Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "legiontools7a" / "llm-mcp"
 )
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
 MAX_FILE_BYTES = 2_000_000
 MAX_INPUT_TOKENS = 100_000  # ~4-5 min at the measured ~370 tokens/s; beyond that, narrow paths
@@ -93,6 +96,12 @@ SEARCH_QUERY_PREFIX = (
 
 TASK_TIMEOUT = 15 * 60
 TASK_MAX_TIMEOUT = 28 * 60  # Claude Code drops a silent stdio tool call after 30 min
+# Workers edit the working tree, so tasks in one repository queue behind each other.
+TASK_QUEUE_WAIT = 30 * 60
+SEARCH_QUEUE_WAIT = 10 * 60
+QUEUE_PROGRESS_SECONDS = 15
+# Tool calls run on threads; how many llama-server serves at once is up to its slots.
+MAX_CONCURRENT_CALLS = 8
 TEST_TIMEOUT = 5 * 60
 TASK_SUMMARY_CHARS = 1500
 TEST_OUTPUT_LINES = 30
@@ -242,11 +251,60 @@ class ToolError(Exception):
     """A problem to report back to the caller as a tool error."""
 
 
+class Cancelled(ToolError):
+    """The caller cancelled the request (MCP notifications/cancelled)."""
+
+
 Progress = Callable[[int, int, str], None]
 
 
 def no_progress(done: int, total: int, message: str) -> None:
     pass
+
+
+def check(cancel: threading.Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise Cancelled("cancelled")
+
+
+def root_key(root: Path) -> str:
+    return hashlib.sha256(str(root).encode()).hexdigest()[:16]
+
+
+@contextmanager
+def queue_lock(
+    path: Path,
+    waiting: str,
+    max_wait: float,
+    progress: Progress = no_progress,
+    cancel: threading.Event | None = None,
+) -> Iterator[None]:
+    """Hold an exclusive lock on `path`, waiting (with progress) while another holds it.
+
+    flock is per open file, so this queues threads of one server as well as servers
+    of other Claude Code sessions.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as lock:
+        start = time.monotonic()
+        last = start - QUEUE_PROGRESS_SECONDS
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                check(cancel)
+                now = time.monotonic()
+                if now - start >= max_wait:
+                    raise ToolError(f"{waiting}: gave up after {max_wait / 60:.0f} min") from None
+                if now - last >= QUEUE_PROGRESS_SECONDS:
+                    progress(int(now - start), int(max_wait), f"{waiting} ({now - start:.0f} s)")
+                    last = now
+                if cancel is not None:
+                    cancel.wait(0.5)
+                else:
+                    time.sleep(0.5)
+        yield
 
 
 # --------------------------------------------------------------------------- client
@@ -262,7 +320,7 @@ class Client:
         self.model = model
         self.embed_model = embed_model
         self.timeout = timeout
-        self._ctx: int | None = None
+        self._props: dict | None = None
 
     def _request(self, path: str, payload: dict | None = None) -> dict:
         data = json.dumps(payload).encode() if payload is not None else None
@@ -281,12 +339,19 @@ class Client:
                 "Is llama-swap running? (systemctl status llama-swap)"
             ) from e
 
+    def props(self) -> dict:
+        """The chat model's server settings (loads the model if needed)."""
+        if self._props is None:
+            self._props = self._request(f"/upstream/{self.model}/props")
+        return self._props
+
     def context_size(self) -> int:
-        """Context the chat model was started with (loads the model if needed)."""
-        if self._ctx is None:
-            props = self._request(f"/upstream/{self.model}/props")
-            self._ctx = int(props["default_generation_settings"]["n_ctx"])
-        return self._ctx
+        """Context of one request slot."""
+        return int(self.props()["default_generation_settings"]["n_ctx"])
+
+    def slots(self) -> int:
+        """Requests the chat model serves at once (llama-server -np)."""
+        return max(1, int(self.props().get("total_slots") or 1))
 
     def count_tokens(self, text: str) -> int:
         """Exact token count from the chat model's tokenizer (fast; no generation)."""
@@ -474,12 +539,40 @@ def pack(blocks: list[Block], budget: int) -> list[str]:
     return chunks
 
 
+def read_parts(
+    client: Client,
+    chunks: list[str],
+    question: str,
+    progress: Progress = no_progress,
+    cancel: threading.Event | None = None,
+) -> list[str]:
+    """Notes on each chunk, in order, reading as many at once as the server has slots."""
+
+    def read(chunk: str) -> str:
+        check(cancel)
+        return client.chat(SYSTEM_MAP, f"{chunk}\n\nQuestion: {question}", NOTE_TOKENS)
+
+    notes = [""] * len(chunks)
+    progress(0, len(chunks) + 1, f"reading {len(chunks)} parts")
+    with ThreadPoolExecutor(max_workers=client.slots()) as pool:
+        futures = {pool.submit(read, chunk): i for i, chunk in enumerate(chunks)}
+        try:
+            for done, future in enumerate(as_completed(futures), 1):
+                notes[futures[future]] = future.result()
+                progress(done, len(chunks) + 1, f"read part {done} of {len(chunks)}")
+        except BaseException:
+            pool.shutdown(cancel_futures=True)
+            raise
+    return notes
+
+
 def ask(
     client: Client,
     ws: Workspace,
     question: str,
     paths: list[str],
     progress: Progress = no_progress,
+    cancel: threading.Event | None = None,
 ) -> str:
     if not question.strip():
         raise ToolError("question is empty")
@@ -505,13 +598,13 @@ def ask(
         answer = client.chat(SYSTEM_ASK, f"{chunks[0]}\n\nQuestion: {question}", ANSWER_TOKENS)
         calls = 1
     else:
-        notes: list[str] = []
-        for i, chunk in enumerate(chunks):
-            progress(i, len(chunks) + 1, f"reading part {i + 1} of {len(chunks)}")
-            note = client.chat(SYSTEM_MAP, f"{chunk}\n\nQuestion: {question}", NOTE_TOKENS)
-            calls += 1
-            if note and NOTHING not in note[: len(NOTHING) + 10]:
-                notes.append(note)
+        notes = [
+            note
+            for note in read_parts(client, chunks, question, progress, cancel)
+            if note and NOTHING not in note[: len(NOTHING) + 10]
+        ]
+        calls += len(chunks)
+        check(cancel)
         progress(len(chunks), len(chunks) + 1, "combining")
         if not notes:
             answer = "Nothing relevant found in these files."
@@ -588,8 +681,7 @@ class Index:
     def __init__(self, ws: Workspace, client: Client, cache_dir: Path = CACHE_DIR) -> None:
         self.ws = ws
         self.client = client
-        key = hashlib.sha256(str(ws.root).encode()).hexdigest()[:16]
-        self.file = cache_dir / f"index-{key}.json"
+        self.file = cache_dir / f"index-{root_key(ws.root)}.json"
         self.data: dict[str, Any] = {"root": str(ws.root), "model": client.embed_model}
         self.data["files"] = {}
         try:
@@ -599,7 +691,12 @@ class Index:
         except (OSError, ValueError):
             pass
 
-    def update(self, files: list[Path], progress: Progress = no_progress) -> tuple[int, list[Path]]:
+    def update(
+        self,
+        files: list[Path],
+        progress: Progress = no_progress,
+        cancel: threading.Event | None = None,
+    ) -> tuple[int, list[Path]]:
         """Embed new or changed files, at most SEARCH_MAX_NEW_CHUNKS chunks per call.
 
         Returns how many files were embedded and the files still waiting. Progress is
@@ -626,6 +723,9 @@ class Index:
             stat = path.stat()
             chunks: list[list[Any]] = []
             for j in range(0, len(parts), EMBED_BATCH):
+                if cancel is not None and cancel.is_set():
+                    self.save()  # keep the files finished so far
+                    check(cancel)
                 progress(done + j, done + len(parts), f"embedding {name}")
                 batch = parts[j : j + EMBED_BATCH]
                 vectors = self.client.embed([f"{name}\n{text}" for _, _, text in batch])
@@ -679,6 +779,7 @@ def search(
     limit: int = 8,
     progress: Progress = no_progress,
     cache_dir: Path = CACHE_DIR,
+    cancel: threading.Event | None = None,
 ) -> str:
     if not query.strip():
         raise ToolError("query is empty")
@@ -695,9 +796,13 @@ def search(
     ]
     if not files:
         raise ToolError(f"{path}: no text files to search")
-    index = Index(ws, client, cache_dir)
-    embedded, waiting = index.update(files, progress)
-    hits = index.search(query, files, max(1, min(limit, 50)))
+    # One search per project at a time: they share the index file.
+    lock = cache_dir / f"index-{root_key(ws.root)}.lock"
+    with queue_lock(lock, "waiting for another search of this project", SEARCH_QUEUE_WAIT,
+                    progress, cancel):  # fmt: skip
+        index = Index(ws, client, cache_dir)
+        embedded, waiting = index.update(files, progress, cancel)
+        hits = index.search(query, files, max(1, min(limit, 50)))
     lines = [
         f"[local search · {len(files)} files · {embedded} re-embedded"
         f" · {time.monotonic() - start:.1f} s]"
@@ -796,10 +901,30 @@ def worker_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if not k.startswith(STRIPPED_ENV_PREFIXES)}
 
 
+def stop(proc: subprocess.Popen) -> tuple[str, str]:
+    """Kill a process and its children (own process group); returns stdout, stderr."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+            return proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            continue
+        except ProcessLookupError:
+            break
+    return proc.communicate()
+
+
 def run_worker(
-    cmd: list[str], root: Path, timeout: float, progress: Progress
+    cmd: list[str],
+    root: Path,
+    timeout: float,
+    progress: Progress,
+    cancel: threading.Event | None = None,
 ) -> tuple[str, str, bool]:
-    """Run the worker, reporting progress every 15 s; returns stdout, stderr, timed_out."""
+    """Run the worker, reporting progress every 15 s; returns stdout, stderr, timed_out.
+
+    The worker is killed on timeout, on cancel (raising Cancelled) or on any error.
+    """
     start = time.monotonic()
     proc = subprocess.Popen(
         cmd,
@@ -811,27 +936,25 @@ def run_worker(
         text=True,
         start_new_session=True,  # own process group, so a timeout kills its children too
     )
-    while True:
-        elapsed = time.monotonic() - start
-        try:
-            out, err = proc.communicate(timeout=min(15, max(timeout - elapsed, 0.1)))
-            return out, err, False
-        except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - start
-            if elapsed >= timeout:
+    last = start
+    try:
+        while True:
+            try:
+                out, err = proc.communicate(timeout=1)
+                return out, err, False
+            except subprocess.TimeoutExpired:
+                pass
+            check(cancel)
+            now = time.monotonic()
+            if now - start >= timeout:
                 break
-            progress(int(elapsed), int(timeout), f"worker running ({elapsed:.0f} s)")
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(proc.pid, sig)
-            out, err = proc.communicate(timeout=10)
-            return out, err, True
-        except subprocess.TimeoutExpired:
-            continue
-        except ProcessLookupError:
-            break
-    out, err = proc.communicate()
-    return out, err, True
+            if now - last >= 15:
+                progress(int(now - start), int(timeout), f"worker running ({now - start:.0f} s)")
+                last = now
+    except BaseException:
+        stop(proc)
+        raise
+    return *stop(proc), True
 
 
 def run_tests(command: list[str], root: Path) -> tuple[bool, str]:
@@ -865,6 +988,7 @@ def task(
     worker: list[str] | None = None,
     lock_dir: Path = CACHE_DIR,
     protect: list[str] | None = None,
+    cancel: threading.Event | None = None,
 ) -> str:
     if not spec.strip():
         raise ToolError("task is empty")
@@ -916,24 +1040,23 @@ def task(
         cmd += ["--disallowedTools", *denied]
     cmd += ["--allowedTools", *allowed]
 
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    with (lock_dir / "task.lock").open("w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as e:
-            raise ToolError("another local_task is running; the local model serves one") from e
+    lock = lock_dir / f"task-{root_key(ws.root)}.lock"
+    with queue_lock(lock, "queued behind another local_task in this repository",
+                    TASK_QUEUE_WAIT, progress, cancel):  # fmt: skip
         start = time.monotonic()
         before = dirty_files(ws.root)
         saved = {n: (ws.root / n).read_bytes() for n in protected if (ws.root / n).is_file()}
         progress(0, timeout, "starting worker")
-        out, err, timed_out = run_worker(cmd, ws.root, timeout, progress)
-        minutes = (time.monotonic() - start) / 60
         restored = []
-        for name, content in sorted(saved.items()):
-            path = ws.root / name
-            if not path.is_file() or path.read_bytes() != content:
-                path.write_bytes(content)
-                restored.append(name)
+        try:
+            out, err, timed_out = run_worker(cmd, ws.root, timeout, progress, cancel)
+        finally:  # also when cancelled: never leave tests rewritten by the worker
+            for name, content in sorted(saved.items()):
+                path = ws.root / name
+                if not path.is_file() or path.read_bytes() != content:
+                    path.write_bytes(content)
+                    restored.append(name)
+        minutes = (time.monotonic() - start) / 60
         changes = describe_changes(ws.root, before, dirty_files(ws.root), names)
         if test_argv:
             progress(timeout, timeout, "running tests")
@@ -992,7 +1115,12 @@ def task(
 
 
 class Server:
-    """MCP over stdio: newline-delimited JSON-RPC 2.0, tools only."""
+    """MCP over stdio: newline-delimited JSON-RPC 2.0, tools only.
+
+    Tool calls run on threads, so a long call (Claude Code moves calls over two minutes
+    to the background) doesn't hold up the next one. A call stops when Claude Code
+    sends notifications/cancelled for it, and gets no response then, per the spec.
+    """
 
     def __init__(
         self, client: Client, ws: Workspace, out: IO[str], cache_dir: Path = CACHE_DIR
@@ -1001,32 +1129,85 @@ class Server:
         self.ws = ws
         self.out = out
         self.cache_dir = cache_dir
+        self._out_lock = threading.Lock()
+        self._calls_lock = threading.Lock()
+        self._calls: dict[str | int, threading.Event] = {}  # running tool calls by request id
 
     def send(self, message: dict) -> None:
-        self.out.write(json.dumps(message) + "\n")
-        self.out.flush()
+        line = json.dumps(message) + "\n"
+        with self._out_lock:
+            self.out.write(line)
+            self.out.flush()
 
     def serve(self, stdin: IO[str]) -> None:
-        for line in stdin:
-            if not line.strip():
-                continue
+        with ThreadPoolExecutor(MAX_CONCURRENT_CALLS, thread_name_prefix="tool") as pool:
             try:
-                message = json.loads(line)
-            except ValueError:
-                self.send(error_response(None, -32700, "parse error"))
-                continue
-            response = self.handle(message)
-            if response is not None:
+                for line in stdin:
+                    if not line.strip():
+                        continue
+                    try:
+                        message = json.loads(line)
+                    except ValueError:
+                        self.send(error_response(None, -32700, "parse error"))
+                        continue
+                    if self.is_tool_call(message):
+                        self.start_call(pool, message)
+                        continue
+                    response = self.handle(message)
+                    if response is not None:
+                        self.send(response)
+            finally:
+                # Client gone: stop running calls (kills workers) and let threads finish.
+                with self._calls_lock:
+                    for event in self._calls.values():
+                        event.set()
+
+    @staticmethod
+    def is_tool_call(message: Any) -> bool:
+        return (
+            isinstance(message, dict)
+            and message.get("jsonrpc") == "2.0"
+            and message.get("method") == "tools/call"
+            and isinstance(message.get("id"), str | int)
+        )
+
+    def start_call(self, pool: ThreadPoolExecutor, message: dict) -> None:
+        msg_id = message["id"]
+        cancel = threading.Event()
+        with self._calls_lock:
+            self._calls[msg_id] = cancel
+
+        def run() -> None:
+            try:
+                response = self.handle(message)
+            finally:
+                with self._calls_lock:
+                    self._calls.pop(msg_id, None)
+            if response is not None and not cancel.is_set():
                 self.send(response)
+
+        pool.submit(run)
+
+    def cancel(self, params: dict) -> None:
+        request_id = params.get("requestId")
+        if not isinstance(request_id, str | int):
+            return
+        with self._calls_lock:
+            event = self._calls.get(request_id)
+        if event is not None:
+            log.info("cancelling request %s: %s", request_id, params.get("reason"))
+            event.set()
 
     def handle(self, message: Any) -> dict | None:
         if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
             return error_response(None, -32600, "invalid request")
         method = message.get("method")
-        if "id" not in message:
-            return None  # notification (initialized, cancelled, ...): nothing to answer
-        msg_id = message["id"]
         params = message.get("params") or {}
+        if "id" not in message:
+            if method == "notifications/cancelled":
+                self.cancel(params if isinstance(params, dict) else {})
+            return None  # notifications get no answer
+        msg_id = message["id"]
         if method == "initialize":
             requested = params.get("protocolVersion")
             version = requested if requested in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
@@ -1044,13 +1225,18 @@ class Server:
         if method == "tools/list":
             return result_response(msg_id, {"tools": TOOLS})
         if method == "tools/call":
-            text, is_error = self.call_tool(params)
+            with self._calls_lock:
+                cancel = self._calls.get(msg_id) if isinstance(msg_id, str | int) else None
+            try:
+                text, is_error = self.call_tool(params, cancel)
+            except Cancelled:
+                return None
             return result_response(
                 msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error}
             )
         return error_response(msg_id, -32601, f"method not found: {method}")
 
-    def call_tool(self, params: dict) -> tuple[str, bool]:
+    def call_tool(self, params: dict, cancel: threading.Event | None = None) -> tuple[str, bool]:
         name = params.get("name")
         args = params.get("arguments") or {}
         token = (params.get("_meta") or {}).get("progressToken")
@@ -1074,7 +1260,7 @@ class Server:
             if name == "local_ask":
                 return ask(
                     self.client, self.ws, str(args.get("question", "")),
-                    [str(p) for p in args.get("paths") or []], progress,
+                    [str(p) for p in args.get("paths") or []], progress, cancel,
                 ), False  # fmt: skip
             if name == "local_task":
                 return task(
@@ -1083,15 +1269,17 @@ class Server:
                     str(args.get("test_command") or ""), self.client.model,
                     int(args.get("timeout_minutes") or TASK_TIMEOUT // 60),
                     progress, lock_dir=self.cache_dir,
-                    protect=[str(p) for p in args.get("protect") or []],
+                    protect=[str(p) for p in args.get("protect") or []], cancel=cancel,
                 ), False  # fmt: skip
             if name == "local_search":
                 return search(
                     self.client, self.ws, str(args.get("query", "")),
                     str(args.get("path") or "."), int(args.get("limit") or 8),
-                    progress, self.cache_dir,
+                    progress, self.cache_dir, cancel,
                 ), False  # fmt: skip
             return f"unknown tool: {name}", True
+        except Cancelled:
+            raise
         except ToolError as e:
             return str(e), True
         except Exception as e:

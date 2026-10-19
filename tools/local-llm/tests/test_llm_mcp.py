@@ -1,9 +1,12 @@
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -23,14 +26,18 @@ class FakeClient:
     embed_model = "fake-embed"
     KEYWORDS = ("alpha", "beta", "gamma")
 
-    def __init__(self, ctx: int = 8192, answers: list[str] | None = None) -> None:
+    def __init__(self, ctx: int = 8192, answers: list[str] | None = None, slots: int = 1) -> None:
         self.ctx = ctx
+        self.n_slots = slots
         self.answers = list(answers or [])
         self.prompts: list[tuple[str, str]] = []
         self.embedded: list[str] = []
 
     def context_size(self) -> int:
         return self.ctx
+
+    def slots(self) -> int:
+        return self.n_slots
 
     def count_tokens(self, text):
         # Digits cost a token each (like Qwen's tokenizer); other text ~4 chars/token.
@@ -193,6 +200,35 @@ def test_ask_nothing_relevant(project):
     assert "Nothing relevant" in out
 
 
+def test_read_parts_uses_all_slots_and_keeps_order():
+    client = FakeClient(slots=2)
+    running, peak, lock = 0, 0, threading.Lock()
+
+    def chat(system, prompt, max_tokens):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.05)
+        with lock:
+            running -= 1
+        return prompt.split("\n")[0]
+
+    client.chat = chat
+    chunks = [f"part {i}" for i in range(6)]
+    assert mcp.read_parts(client, chunks, "q") == chunks
+    assert peak == 2
+
+
+def test_ask_cancelled(project):
+    big = project / "big.log"
+    big.write_text("\n".join("x" * 60 for _ in range(400)))
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(mcp.Cancelled):
+        mcp.ask(FakeClient(ctx=3000), mcp.Workspace(project), "q", ["big.log"], cancel=cancel)
+
+
 def test_ask_errors(project):
     ws = mcp.Workspace(project)
     with pytest.raises(mcp.ToolError, match="empty"):
@@ -269,6 +305,20 @@ def test_search_skips_large_files(project, tmp_path, monkeypatch):
     assert "2 files" in out
 
 
+def test_search_queues_behind_another_search(project, tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    lock = cache / f"index-{mcp.root_key(project.resolve())}.lock"
+    messages = []
+    with lock.open("w") as held:
+        mcp.fcntl.flock(held, mcp.fcntl.LOCK_EX)
+        threading.Timer(0.7, held.close).start()
+        out = mcp.search(FakeClient(), mcp.Workspace(project), "alpha", cache_dir=cache,
+                         progress=lambda d, t, m: messages.append(m))  # fmt: skip
+    assert "src/a.py" in out
+    assert messages[0].startswith("waiting for another search")
+
+
 def test_search_outside_project(project, tmp_path):
     with pytest.raises(mcp.ToolError, match="project only"):
         mcp.search(FakeClient(), mcp.Workspace(project, [tmp_path]), "q", str(tmp_path))
@@ -302,6 +352,12 @@ def test_notifications_get_no_response(server):
     assert rpc(server, "notifications/initialized", msg_id=None) is None
 
 
+def test_cancel_notifications_for_unknown_or_malformed_ids(server):
+    for request_id in (99, ["not", "hashable"], None):
+        assert rpc(server, "notifications/cancelled", {"requestId": request_id}, None) is None
+    assert rpc(server, "notifications/cancelled", msg_id=None) is None
+
+
 def test_tools_list(server):
     tools = rpc(server, "tools/list")["result"]["tools"]
     assert [t["name"] for t in tools] == ["local_task", "local_ask", "local_search"]
@@ -333,6 +389,86 @@ def test_progress_notifications_sent_with_token(server):
     assert sent[0]["params"]["progressToken"] == "t1"
 
 
+class Session:
+    """Server.serve on a pipe in a thread, as Claude Code drives it."""
+
+    def __init__(self, server):
+        self.server = server
+        self.out = server.out
+        read_fd, write_fd = os.pipe()
+        self.stdin = os.fdopen(write_fd, "w")
+        self.thread = threading.Thread(target=server.serve, args=(os.fdopen(read_fd),))
+        self.thread.start()
+
+    def send(self, method, params=None, msg_id=None):
+        message = {"jsonrpc": "2.0", "method": method, "params": params or {}}
+        if msg_id is not None:
+            message["id"] = msg_id
+        self.stdin.write(json.dumps(message) + "\n")
+        self.stdin.flush()
+
+    def replies(self):
+        return [json.loads(line) for line in self.out.getvalue().splitlines()]
+
+    def wait_for(self, condition, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not condition():
+            assert time.monotonic() < deadline, "timed out"
+            time.sleep(0.01)
+
+    def close(self):
+        self.stdin.close()
+        self.thread.join(timeout=10)
+        assert not self.thread.is_alive()
+
+
+def ask_call(question="q"):
+    return {"name": "local_ask", "arguments": {"question": question, "paths": ["src/a.py"]}}
+
+
+def test_serve_runs_tool_calls_concurrently(project, tmp_path):
+    client = FakeClient()
+    gate, inside = threading.Event(), []
+
+    def chat(system, prompt, max_tokens):
+        inside.append(1)
+        gate.wait(5)
+        return "done"
+
+    client.chat = chat
+    session = Session(mcp.Server(client, mcp.Workspace(project), io.StringIO(), tmp_path / "c"))
+    session.send("tools/call", ask_call(), msg_id=1)
+    session.send("tools/call", ask_call(), msg_id=2)
+    session.send("ping", msg_id=3)
+    session.wait_for(lambda: len(inside) == 2)  # both calls are in the model at once
+    session.wait_for(lambda: any(r.get("id") == 3 for r in session.replies()))
+    assert [r["id"] for r in session.replies()] == [3]  # ping answered meanwhile
+    gate.set()
+    session.wait_for(lambda: len(session.replies()) == 3)
+    session.close()
+    results = {r["id"]: r["result"] for r in session.replies() if r["id"] != 3}
+    assert sorted(results) == [1, 2]
+    assert all(not r["isError"] and "done" in r["content"][0]["text"] for r in results.values())
+
+
+def test_cancelled_call_gets_no_response(project, tmp_path):
+    client = FakeClient()
+    gate = threading.Event()
+    client.chat = lambda s, p, m: gate.wait(5) and "done"
+    server = mcp.Server(client, mcp.Workspace(project), io.StringIO(), tmp_path / "c")
+    session = Session(server)
+    session.send("tools/call", ask_call(), msg_id=5)
+    session.wait_for(lambda: 5 in server._calls)
+    session.send("notifications/cancelled", {"requestId": 5, "reason": "user stopped it"})
+    session.wait_for(lambda: server._calls.get(5) is None or server._calls[5].is_set())
+    gate.set()
+    session.send("ping", msg_id=6)
+    session.wait_for(lambda: any(r.get("id") == 6 for r in session.replies()))
+    session.close()
+    assert [r["id"] for r in session.replies()] == [6]
+    assert server._calls == {}
+
+
 def test_serve_loop_parse_error_and_responses(project, tmp_path):
     out = io.StringIO()
     server = mcp.Server(FakeClient(), mcp.Workspace(project), out, tmp_path / "c")
@@ -357,6 +493,10 @@ FAKE_WORKER = textwrap.dedent("""
     mode = os.environ.get("FAKE_MODE", "ok")
     Path("env.txt").write_text(" ".join(sorted(k for k in os.environ if "CLAUDE" in k)))
     if mode == "sleep":
+        time.sleep(60)
+    if mode == "cheat_then_sleep":
+        Path("test_calc.py").write_text("def test_nothing():\\n    pass\\n")
+        Path("started").touch()
         time.sleep(60)
     if mode == "crash":
         sys.exit("boom")
@@ -461,13 +601,66 @@ def test_task_needs_git(project, tmp_path):
         mcp.task(mcp.Workspace(project), "x", [], "", "fake", lock_dir=tmp_path)
 
 
-def test_task_one_at_a_time(repo, tmp_path):
+def hold_task_lock(repo, tmp_path):
     lock_dir = tmp_path / "lock"
-    lock_dir.mkdir()
-    with (lock_dir / "task.lock").open("w") as held:
-        mcp.fcntl.flock(held, mcp.fcntl.LOCK_EX | mcp.fcntl.LOCK_NB)
-        with pytest.raises(mcp.ToolError, match="another local_task"):
-            run_task(repo, tmp_path)
+    lock_dir.mkdir(exist_ok=True)
+    held = (lock_dir / f"task-{mcp.root_key(repo[0].resolve())}.lock").open("w")
+    mcp.fcntl.flock(held, mcp.fcntl.LOCK_EX | mcp.fcntl.LOCK_NB)
+    return held
+
+
+def test_task_queues_behind_another_in_the_same_repo(repo, tmp_path):
+    held = hold_task_lock(repo, tmp_path)
+    threading.Timer(0.7, held.close).start()
+    messages = []
+    out = run_task(repo, tmp_path, progress=lambda d, t, m: messages.append(m))
+    assert messages[0].startswith("queued behind another local_task")
+    assert "PASSED" in out
+
+
+def test_task_queue_gives_up(repo, tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp, "TASK_QUEUE_WAIT", 0.5)
+    held = hold_task_lock(repo, tmp_path)
+    with held, pytest.raises(mcp.ToolError, match="gave up"):
+        run_task(repo, tmp_path)
+
+
+def test_task_cancelled_while_queued(repo, tmp_path):
+    held = hold_task_lock(repo, tmp_path)
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    with held, pytest.raises(mcp.Cancelled):
+        run_task(repo, tmp_path, cancel=cancel)
+    assert not (repo[0] / "calc.py").exists()  # the worker never started
+
+
+def test_task_cancel_kills_worker_and_restores_tests(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_MODE", "cheat_then_sleep")
+    root = repo[0]
+    original = (root / "test_calc.py").read_text()
+    cancel = threading.Event()
+
+    def cancel_once_started():
+        while not (root / "started").exists():
+            time.sleep(0.05)
+        cancel.set()
+
+    threading.Thread(target=cancel_once_started, daemon=True).start()
+    start = time.monotonic()
+    with pytest.raises(mcp.Cancelled):
+        run_task(repo, tmp_path, cancel=cancel)
+    assert time.monotonic() - start < 15
+    assert (root / "test_calc.py").read_text() == original
+
+
+def test_run_worker_cancel_kills_process(tmp_path):
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    start = time.monotonic()
+    cmd = [sys.executable, "-c", "import time; time.sleep(60)"]
+    with pytest.raises(mcp.Cancelled):
+        mcp.run_worker(cmd, tmp_path, 60, mcp.no_progress, cancel)
+    assert time.monotonic() - start < 5
 
 
 def test_dirty_files_handles_renames(repo):

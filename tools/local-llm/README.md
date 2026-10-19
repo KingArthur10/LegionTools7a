@@ -131,9 +131,23 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
   `~/.ssh`) and binaries are skipped, and the answer lists what was skipped.
 - **Limits:** 100K tokens per call, counted with the model's tokenizer. Reading
   runs at ~370 tokens/s, so that is 4-5 minutes; narrow the paths beyond that.
-  `qwen3-coder` serves two requests at once (`-np 2`), but the MCP server handles
-  one tool call at a time, so parallel tool calls queue. After 30 minutes idle,
-  the first call waits ~10 s for the model to load.
+  After 30 minutes idle, the first call waits ~10 s for the model to load.
+- **Concurrency:** tool calls run on threads, and `qwen3-coder` serves two
+  requests at once (`-np 2`), so two calls overlap (measured: two `local_ask`
+  calls in 2.2 s instead of 3.4 s). `local_ask` reads the parts of a large input
+  as many at a time as the server has slots. Claude Code moves a call that runs
+  over 2 minutes to the background and gets the result as a notification, so it
+  can keep working or send the next call meanwhile.
+- **Queueing:** `local_task`s in the same repository wait for each other (the
+  worker edits the working tree), as do `local_search`es of the same project
+  (they share the index). Waiting sends progress messages, so Claude Code doesn't
+  time out; `local_task` gives up after 30 min in the queue. Different
+  repositories don't wait, including across Claude Code sessions.
+- **Cancelling:** stopping a call (e.g. in `/tasks`) sends
+  `notifications/cancelled`: a queued call leaves the queue, a running worker is
+  killed (protected test files are still restored; its partial edits stay in the
+  tree for review), and `local_ask` stops before its next part. The test run after
+  a worker is not interrupted (5 min max).
 - **Trust:** answers come from a 30B model. The server's instructions tell Claude
   to treat them as leads and to read cited lines itself before editing.
 - **`local_task` workflow:** Claude writes the spec and the tests, the worker
@@ -148,8 +162,8 @@ claude mcp add -s user local-llm -- "$PWD/llm_mcp.py"    # once; available in ev
     `protect` paths are denied to the worker, and if one changes anyway the server
     restores it and puts a warning at the top of the report;
   - new files outside `files` are flagged `NOT REQUESTED`;
-  - one task at a time, 15 min by default (max 28: Claude Code drops a silent
-    stdio call after 30), with progress messages every 15 s.
+  - one task per repository at a time (see Queueing), 15 min by default (max 28:
+    Claude Code drops a silent stdio call after 30), with progress messages every 15 s.
   First real run (in-memory chat store, 5 spec tests): 2.6 min, tests passed.
   Before protection existed, a worker facing a broken test command rewrote the
   spec's tests to make them pass, which is why they're protected now.
