@@ -6,3 +6,5 @@
 1	helper	ggml-org/gpt-oss-20b-GGUF	gpt-oss-20b-MXFP4.gguf	12109566624	27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901
 1	embed	Qwen/Qwen3-Embedding-0.6B-GGUF	Qwen3-Embedding-0.6B-Q8_0.gguf	639150592	06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439
 1	embed	Qwen/Qwen3-Embedding-4B-GGUF	Qwen3-Embedding-4B-Q4_K_M.gguf	2496703776	2b0cf8f17b4c723c27303015383c27ec4bf2d8314bb677d05e920dd70bb0f16b
+1	orchestrator	unsloth/GLM-4.7-Flash-GGUF	GLM-4.7-Flash-UD-Q4_K_XL.gguf	17520169312	b0d4fbc1211f891b4cfbf2a497160bfe06a49412420068904d426b7a13f4ba7f
+1	orchestrator	unsloth/gemma-4-26B-A4B-it-GGUF	gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf	17010980576	ef728c8e0c337fd1067b947af006e38a9ef2419e56feced4fd29b4bf0636e30c

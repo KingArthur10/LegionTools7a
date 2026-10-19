@@ -6,7 +6,7 @@
 """Benchmark local models across llama.cpp backends on this machine.
 
 `speed` runs llama-bench for every downloaded model in models.tsv (roles
-primary/helper by default) on each backend, with the settings we intend to serve
+primary/helper/orchestrator by default) on each backend, with the settings we intend to serve
 with (flash attention, q8_0 KV cache, all layers on GPU). Tests mirror our
 workloads: a 4K-token prompt and 128 generated tokens, both on an empty context
 and with 16K tokens already in context (roughly a Claude Code session).
@@ -166,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("speed", help="llama-bench every model on every backend")
     p.add_argument("--backends", nargs="+", choices=BACKENDS, default=list(BACKENDS))
-    p.add_argument("--roles", nargs="+", default=["primary", "helper"])
+    p.add_argument("--roles", nargs="+", default=["primary", "helper", "orchestrator"])
     p.add_argument("--model", nargs="+", help="only models whose name contains this")
     p.add_argument("--prompt", type=int, default=4096, help="prompt tokens (default: 4096)")
     p.add_argument("--gen", type=int, default=128, help="generated tokens (default: 128)")

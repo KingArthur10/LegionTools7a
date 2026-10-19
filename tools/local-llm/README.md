@@ -30,7 +30,7 @@ Fedora's ROCm 7.1.1 already ships `gfx1151` kernels for rocBLAS and hipBLASLt.
 
 ```bash
 ./build-llama-cpp.sh            # both backends (rocm | vulkan | all)
-./download-models.sh            # tier-1 models from models.tsv (~97 GB)
+./download-models.sh            # tier-1 models from models.tsv (~132 GB)
 ./download-models.sh all        # every tier
 ./llm_bench.py speed            # llama-bench every model on both backends
 ./llm_eval.py run               # graded coding tasks (results: docs/local-llm-benchmarks.md)
