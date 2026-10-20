@@ -11,11 +11,25 @@ HERE=$(dirname "$(readlink -f "$0")")
 MANIFEST="$HERE/models.tsv"
 MODELS_DIR="${LLM_MODELS_DIR:-/srv/llm/models}"
 TIER="${1:-1}"
+ATTEMPTS=20     # per file; each attempt resumes the partial download
+STALL_SECONDS=60 # abort an attempt that moves < 100 KB/s for this long
 
 log() { printf '==> %s\n' "$*"; }
 die() {
     printf 'error: %s\n' "$*" >&2
     exit 1
+}
+
+# Download $1 to $2, resuming. curl's own --retry skips some errors (e.g. 92,
+# HTTP/2 stream reset) and a stalled transfer otherwise never ends, so retry here.
+fetch() {
+    local url=$1 out=$2 attempt
+    for ((attempt = 1; attempt <= ATTEMPTS; attempt++)); do
+        curl -fL -C - --speed-limit 102400 --speed-time "$STALL_SECONDS" -o "$out" "$url" && return 0
+        log "attempt $attempt/$ATTEMPTS failed; resuming in 10 s"
+        sleep 10
+    done
+    return 1
 }
 
 case "$TIER" in -h | --help)
@@ -44,8 +58,8 @@ while IFS=$'\t' read -r tier role repo file bytes sha; do
         continue
     fi
     log "fetch   $role  $file ($((bytes / 1000000)) MB)"
-    curl -fL --retry 5 --retry-delay 5 -C - -o "$dest.part" \
-        "https://huggingface.co/$repo/resolve/main/$file"
+    fetch "https://huggingface.co/$repo/resolve/main/$file" "$dest.part" ||
+        die "giving up on $file after $ATTEMPTS attempts"
     [[ $(stat -c %s "$dest.part") == "$bytes" ]] || die "size mismatch for $file"
     echo "$sha  $dest.part" | sha256sum --quiet -c - || die "checksum mismatch for $file"
     mv "$dest.part" "$dest"
