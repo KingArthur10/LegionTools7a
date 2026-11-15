@@ -108,11 +108,14 @@ addresses, UUIDs) are deliberately omitted.
 
 | Item | Value |
 | ---- | ----- |
-| OS | Fedora Linux 44 (KDE Plasma Desktop Edition) |
-| Kernel | 7.2.8-200.fc44 (fallback 6.19.10-300.fc44 installed) |
+| OS | Fedora Linux 45 (KDE Plasma Desktop Edition); upgraded from 44 in 2026-11 |
+| Kernel | 7.3.3-300.fc45 (fallbacks 7.3.3-200.fc44, 7.2.11-200.fc44 installed) |
 | Kernel cmdline | `rhgb quiet ttm.pages_limit=13631488 rootflags=subvol=root` |
 | SELinux | Enforcing |
-| Firmware packages | `linux-firmware`, `amd-gpu-firmware`, `amd-ucode-firmware` 20260916 |
-| systemd | 259.9 |
-| Python | 3.14.7 (system) |
-| Tooling present | `lm_sensors` 3.6.0, `fwupd` 2.1.8, `tuned` 2.28.0 |
+| Firmware packages | `linux-firmware`, `amd-gpu-firmware`, `amd-ucode-firmware` 20261019 |
+| systemd | 262.1 |
+| Python | 3.15.2 (system; 3.14 was removed by the upgrade, see [face-unlock](../tools/face-unlock/README.md#after-a-fedora-or-python-upgrade)) |
+| Tooling present | `lm_sensors` 3.6.0, `fwupd` 2.1.9, `tuned` 2.28.0 |
+
+Software rows last checked 2026-11-14 on kernel 7.3.3-300.fc45; hardware sections are
+from the original 2026-10-03 survey.

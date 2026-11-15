@@ -8,7 +8,8 @@ with an **AMD Ryzen AI Max "Strix Halo"** APU, running **Fedora Linux**.
 - CPU/GPU: AMD Strix Halo (Zen 5 CPU + RDNA 3.5 iGPU, `gfx1151`), unified memory
   shared between CPU and GPU (VRAM carve-out set in BIOS / via GTT).
 - NPU: AMD XDNA 2 (`amdxdna` kernel driver).
-- OS: Fedora 44 KDE (Wayland), kernel 7.2, SELinux **enforcing**, `dnf` package manager.
+- OS: Fedora 45 KDE (Wayland), kernel 7.3, Python 3.15, SELinux **enforcing**, `dnf`
+  package manager. Venvs under `/opt` (e.g. Howdy's) break on Python minor upgrades.
 - Relevant interfaces: `/sys/class/drm`, `/sys/class/hwmon`, `/sys/devices/system/cpu`,
   `/sys/firmware/acpi/platform_profile`, `powerprofilesctl`, `amd-pstate`, ROCm (`rocm-smi`, `amd-smi`).
 - Never assume a path exists — probe and fail with a clear message if hardware or a

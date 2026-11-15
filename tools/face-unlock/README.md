@@ -36,7 +36,7 @@ exist, and its `python3-pyv4l2`/`python3-keyboard` builds target Python 3.13.
 
 | Path | Contents |
 | ---- | -------- |
-| `/opt/howdy/` | Howdy, CLI, dlib models, and `venv/` (dlib 20.0.1, OpenCV 4.14, NumPy 2.5) |
+| `/opt/howdy/` | Howdy, CLI, dlib models, and `venv/` (dlib 20.0.1, OpenCV 4.14, NumPy 2.5; rebuilt for Python 3.15 on Fedora 45, see [below](#after-a-fedora-or-python-upgrade)) |
 | `/etc/howdy/` | `config.ini` and face models (`models/<user>.dat`) |
 | `/usr/lib64/security/pam_howdy.so` | PAM module |
 | `/usr/local/bin/howdy` | Symlink to the CLI |
@@ -75,6 +75,52 @@ under `sudo` without `uv`.
 sudo ./install-howdy.sh uninstall           # removes PAM rules, /opt/howdy, module
 sudo ./install-howdy.sh uninstall --purge   # also removes /etc/howdy (face models)
 ```
+
+## After a Fedora or Python upgrade
+
+`/opt/howdy/venv` is tied to the Python minor version it was created with. A Fedora
+release upgrade that bumps the system Python (Fedora 45: 3.14 → 3.15, 2026-11) removes
+the old interpreter, and face authentication then fails with:
+
+```
+Attempting facial authentication
+Traceback (most recent call last):
+  File "/opt/howdy/lib64/howdy/compare.py", line 17, in <module>
+    import dlib
+ModuleNotFoundError: No module named 'dlib'. Did you mean: 'zlib'?
+```
+
+The packages are still installed, but in `venv/lib/python3.14/site-packages`; the
+venv's `python3` symlink now resolves to 3.15, which looks in `python3.15/`. The
+password fallback keeps working, so nothing locks you out. Face models and
+`config.ini` in `/etc/howdy` are unaffected, and the C++ PAM module only stores the
+path `/opt/howdy/venv/bin/python`, so neither Howdy nor PAM needs rebuilding — only
+the venv:
+
+```bash
+sudo mv /opt/howdy/venv /opt/howdy/venv.py314.bak
+sudo python3 -m venv /opt/howdy/venv
+sudo /opt/howdy/venv/bin/pip install dlib==20.0.1 numpy opencv-python-headless==4.14.0.94
+sudo restorecon -Rv /opt/howdy/venv      # lib_t on the .so files, as before
+sudo -k && sudo true                     # should say "Attempting facial authentication"
+sudo rm -rf /opt/howdy/venv.py314.bak    # once face unlock works
+```
+
+- dlib compiles from source (a few minutes); `cmake`, `gcc-c++` and `python3-devel`
+  must be installed. NumPy and OpenCV ship wheels for new Pythons quickly (OpenCV's
+  are `abi3`, so the pinned 4.14 works on 3.15).
+- Pin OpenCV: unpinned pip installs **OpenCV 5.0**, which Howdy has not been tested
+  with.
+- To check a new Python before touching `/opt`, build the same packages in a scratch
+  venv as your user and `import dlib, cv2, numpy`.
+- `sudo howdy test` fails with `cv2.error: ... The function is not implemented.
+  Rebuild the library with Windows, GTK+ 2.x or Cocoa support`. That is expected:
+  `opencv-python-headless` has no GUI, and only `howdy test` opens a window. Test with
+  `sudo -k && sudo true` or the lock screen instead.
+- Don't use `./install-howdy.sh build` for this yet: the build directory
+  (`~/.cache/legiontools7a/face-unlock`) keeps its old `buildvenv`, which is reused
+  without a version check and breaks with the old interpreter gone. Delete
+  `buildvenv/` and `wheels/` there first if you want to go through the installer.
 
 ## Safety notes
 
